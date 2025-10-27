@@ -16,4 +16,4 @@ pip install -r requirements.in > /dev/null
 # Test GPU availability
 # python test_cuda.py
 
-python main.py opt:gd data:cifar10 arch:mlp --data.classes=4 --data.n=1000 --data.criterion=mse --opt.lr=0.02 --runs discrete --steps=1000
+python main.py opt:gd data:cifar10 arch:mlp --data.classes=4 --data.n=1000 --data.criterion=mse --opt.lr=0.02 --runs discrete --steps=2000 --eig.frequency=1
