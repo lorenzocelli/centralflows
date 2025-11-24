@@ -19,6 +19,7 @@ from src.datasets import CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classi
 from src.functional import FunctionalModel
 from src.loss_function import SupervisedLossFunction
 from src.processes import (
+    WeightGroup,
     CentralFlow,
     CentralFlowConfig,
     DiscreteProcess,
@@ -49,7 +50,7 @@ ValidArch = Union[CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet]
 ValidRuns = Set[Literal["discrete", "midpoint", "central", "stable", "stationary"]]
 
 def main(
-    opt: ValidOpt,    # which optimization algorithm to use
+    # opt_: ValidOpt,    # which optimization algorithm to use # TODO make optimizer configurable
     data: ValidData,  # which dataset to train on
     arch: ValidArch,  # which architecture to train
     runs: ValidRuns,  # which processes (e.g. discrete alg, central flow, stable flow) to run
@@ -99,9 +100,13 @@ def main(
     
     # make the model functional. 'model_fn' is a functional version of the network; 'w' are the initial weights
     w, model_fn = FunctionalModel.make_functional(model)
-    
-    # initialize optimizer state
-    state = opt.initialize_state(w) 
+
+    # TODO: allow configuring the optimizer from command line
+    opt = GradientDescent(lr=1e-2)
+    state = opt.initialize_state(w, model_fn.unflatten)
+    groups = {
+        "gd": WeightGroup(opt=opt, state=state, mask=torch.ones_like(w, dtype=torch.bool))
+    }
     
     # put together loss function
     loss_fn = SupervisedLossFunction(
@@ -136,6 +141,8 @@ def main(
         if load.path is not None:
             print("Skipping warm start because checkpoint file is provided")
         else:
+            # TODO: this should be done per-group  
+            raise NotImplementedError("Warm starting not yet implemented")
             print(f"Warm starting for {warm_start} steps")
             for _ in trange(warm_start):
                 w, state = opt.update(w, state, loss_fn.D(w))
@@ -144,7 +151,7 @@ def main(
 
     # initialize processes
     processes = {}
-    kwargs = dict(loss_fn=loss_fn, w=w, state=state, opt=opt, eig_config=eig_config)
+    kwargs = dict(loss_fn=loss_fn, w=w, groups=groups, eig_config=eig_config)
     if "discrete" in runs:
         processes["discrete"] = DiscreteProcess(**kwargs, config=discrete_config)
     if "midpoint" in runs:

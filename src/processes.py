@@ -19,39 +19,87 @@ Array = Any
 
 
 @dataclass
-class Process:
-    """Parent class of discrete optimizer, central flow, stable flow."""
+class WeightGroup:
+    """Encapsulate an optimizer, its state, and the weights it manages."""
 
-    opt: UpdateRule          # the optimizer update rule
-    loss_fn: LossFunction    # the loss function
-    w: Array                 # the current iterate
-    state: Array             # the current optimizer state
-    
+    opt: UpdateRule
+    # TODO: state is not an array
+    # TODO: why is the state not stored in the optimizer itself?
+    state: Array
+    mask: Array
+    eff_eigs: Array = field(init=False, default=None)
+
     # for computing eigenvalues of the effective hessian
     eig_manager: EigManager = field(init=False)
     
     # [optional] for computing eigenvalues of the "raw" hessian
     raw_eig_manager: Optional[EigManager] = field(init=False, default=None)
 
+    def __post_init__(self):
+        # TODO: why do we need to clone the state?
+        self.state = self.state.clone()
+
+    def init_eig_manager(
+        self, 
+        loss_function: LossFunction, 
+        w_example: Array,
+        eig_config: EigConfig,
+    ):
+        w_example = w_example[self.mask]
+
+        # eigenvalue manager for the effective Hessian
+        self.eig_manager = EigManager(
+            loss_fn=loss_function, 
+            w_example=w_example,
+            config=eig_config
+        )
+
+        # if the optimizer admits no trivial way of computing the "raw" Hessian eigenvalues
+        # given the effective Hessian eigenvalues, create an EigManger for the "raw" Hessian
+        if not hasattr(self.opt, "raw_eigs_from_eigs") and eig_config.raw_eigenvalues:
+            self.raw_eig_manager = EigManager(
+                loss_fn=loss_function, 
+                w_example=w_example,
+                config=replace(eig_config, track_threshold=None)
+            )
+
+    def prepare(self, w: Array, gradient: Array) -> Dict:
+        self.state = self.opt.update_state(self.state, gradient[self.mask])
+        P = self.opt.P(self.state)
+
+        timer = Timer()
+        with timer("eig"):
+            self.eff_eigs, _, eig_logs = self.eig_manager.get(w[self.mask], P=P)
+
+        return dict(times=timer.times, eig_logs=eig_logs)
+
+    def step(self, w: Array, gradient: Array) -> Array:
+        w[self.mask] = self.opt.step(w[self.mask], self.state, gradient[self.mask])
+
+
+@dataclass
+class Process:
+    """Parent class of discrete optimizer, central flow, stable flow."""
+
+    loss_fn: LossFunction           # the loss function
+    w: Array                        # the current iterate
+    groups: Dict[str, WeightGroup]  # weight groups managed by this process
+
     # these fields are exposed to users of the class (especially the loggers)
     loss: Array = field(init=False, default=None)
     gradient: Array = field(init=False, default=None)
-    eff_eigs: Array = field(init=False, default=None)
 
     # settings for the eigenvalue computation
     eig_config: InitVar[EigConfig]
 
     def __post_init__(self, eig_config: EigConfig):
         self.w = self.w.clone()
-        self.state = self.state.clone()
-        
-        # eigenvalue manager for the effective Hessian
-        self.eig_manager = EigManager(self.loss_fn, self.w, config=eig_config)
-        
-        # if the optimizer admits no trivial way of computing the "raw" Hessian eigenvalues
-        # given the effective Hessian eigenvalues, create an EigManger for the "raw" Hessian
-        if not hasattr(self.opt, "raw_eigs_from_eigs") and eig_config.raw_eigenvalues:
-            self.raw_eig_manager = EigManager(self.loss_fn, self.w, config=replace(eig_config, track_threshold=None))
+        for group in self.groups.values():
+            group.init_eig_manager(
+                loss_function=self.loss_fn,
+                w_example=self.w,
+                eig_config=eig_config,
+            )
 
     def to_dict(self) -> Dict:
         """Serialize to a dict."""
@@ -59,6 +107,8 @@ class Process:
 
     def from_dict(self, d: Dict):
         """Unserialize from a dict."""
+        # TODO:
+        raise NotImplementedError()
         self.w = torch.tensor(d["w"], dtype=self.w.dtype, device=self.w.device)
         self.state = torch.tensor(
             d["state"], dtype=self.state.dtype, device=self.state.device
@@ -140,15 +190,17 @@ class DiscreteProcess(Process):
         timer = Timer()
         with timer("grad_and_value"):
             self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)
-            self.state = self.opt.update_state(self.state, self.gradient)
-            P = self.opt.P(self.state)
-        with timer("eig"):
-            self.eff_eigs, _, eig_logs = self.eig_manager.get(self.w, P=P)
-        return dict(times=timer.times, eig_logs=eig_logs)
+            for group in self.groups.values():
+                logs = group.prepare(self.w, self.gradient)
+        # TODO: aggregate logs 
+        return dict(times=timer.times, eig_logs=logs)
 
     def step(self):
-        P = self.opt.P(self.state)
-        self.w -= P.pow(-1)(self.gradient)
+        """
+        Perform a single optimization step.
+        """
+        for group in self.groups.values():
+            group.step(self.w, self.gradient)
 
 
 @dataclass

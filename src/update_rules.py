@@ -37,6 +37,20 @@ class UpdateRule:
         """
         raise NotImplementedError()
 
+    def step(self, w: Array, flat_state: Array, gradient: Array) -> Array:
+        """Perform a single optimization step.
+        
+        Args:
+            w (Array): the current weights
+            flat_state (Array): the current state, as a flat vector
+            gradient (Array): the current gradient
+        
+        Returns:
+            Array: the updated weights
+        """
+        P = self.P(flat_state)
+        return w - P.pow(-1)(gradient)
+
     def P(self, flat_state: Array) -> Preconditioner:
         """Return the current preconditioner.
         

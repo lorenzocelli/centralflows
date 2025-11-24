@@ -202,8 +202,10 @@ class EigLogger(ProcessLogger):
         self.eig_manager = None
 
     def log(self, process: Process) -> Dict[str, Any]:
-        eigs = process.eff_eigs
-        return dict(effective_hessian_eigs=eigs)
+        return dict(effective_hessian_eigs={
+            k: g.eff_eigs
+            for k, g in process.groups.items()
+        })
 
 
 class RawEigLogger(ProcessLogger):
@@ -212,24 +214,31 @@ class RawEigLogger(ProcessLogger):
         self.eig_manager = None
 
     def log(self, process: Process) -> Dict[str, Any]:
-        eigs = process.eff_eigs
-        # if there is an efficient way to compute the top eigenvalues of the
-        # raw Hessian from those of the effective Hessian, then use it.
-        if hasattr(process.opt, "raw_eigs_from_eigs"):
-            raw_eigs = process.opt.raw_eigs_from_eigs(process.state, eigs)
-            return dict(hessian_eigs=raw_eigs)
-        else: # otherwise, use the processes's raw_eig_manager to solve for the raw eigs
-            if process.raw_eig_manager is not None:
-                process.raw_eig_manager.solver.n_eigs = process.eig_manager.solver.n_eigs
-                raw_eigs = process.raw_eig_manager.get(process.w)[0]
-                return dict(hessian_eigs=raw_eigs)
-            else:
-                return dict()
+        output = {}
+        for k, group in process.groups.items():
+            eigs = group.eff_eigs
+            # if there is an efficient way to compute the top eigenvalues of the
+            # raw Hessian from those of the effective Hessian, then use it.
+            if hasattr(group.opt, "raw_eigs_from_eigs"):
+                raw_eigs = group.opt.raw_eigs_from_eigs(group.state, eigs)
+                output[k] = dict(hessian_eigs=raw_eigs)
+            else: # otherwise, use the processes's raw_eig_manager to solve for the raw eigs
+                if group.raw_eig_manager is not None:
+                    group.raw_eig_manager.solver.n_eigs = group.eig_manager.solver.n_eigs
+                    # TODO: this should probably be delegated to the process/group since it requires masking
+                    raw_eigs = group.raw_eig_manager.get(process.w[group.mask])[0]
+                    output[k] = dict(hessian_eigs=raw_eigs)
+                else:
+                    output[k] = dict()
+        return output
             
 
 class StateLogger(ProcessLogger):
     """Logs the optimizer state."""
     
     def log(self, process: Process) -> Dict[str, Any]:
-        log = process.opt.summarize_state(process.state)
-        return {"opt."+k : v for k,v in log.items()}
+        output = {}
+        for k, group in process.groups.items():
+            log = group.opt.summarize_state(group.state)
+            output[k] = {"opt."+k : v for k,v in log.items()}
+        return output
