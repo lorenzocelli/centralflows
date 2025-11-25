@@ -317,7 +317,7 @@ class Muon(UpdateRule):
     """
 
     lr: float
-    momentum: float
+    momentum: float = 0.9
     nesterov: bool = True
     ns_steps: int = 3 # Newton-Schulz steps
     eps: float = 1e-7 # for numerical stability
@@ -325,39 +325,69 @@ class Muon(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
+    def bind_model_structure(self, model: torch.nn.Module):
+        """Bind the model structure to the optimizer (debug included)."""
+
+        self._model = model
+
+        assert hasattr(self, "_model"), (
+            "You must call opt.bind_model_structure(model) before initialize_state()!"
+        )
+
+        print("\n[DEBUG] >>> binding model structure <<<")
+
+        params = list(self._model.named_parameters())
+        print(f"[DEBUG] Found {len(params)} parameters in model")
+
+        for name, p in params:
+            print(f"[DEBUG] param: {name:30s} shape={tuple(p.shape)} dim={p.dim()} size={p.numel()}")
+
+        self._names = [name for name, _ in params]
+        self._shapes = [p.shape for _, p in params]
+        self._sizes = [p.numel() for _, p in params]
+
+        print("[DEBUG] sizes:", self._sizes)
+
+        self._offsets = torch.cumsum(
+            torch.tensor([0] + self._sizes[:-1]), dim=0
+        )
+
+        print("[DEBUG] offsets:", self._offsets.tolist())
+        total_sizes = sum(self._sizes)
+
+        print(f"[DEBUG] Total num params (sum shapes) = {total_sizes}")
+        print("[DEBUG] Done binding model structure\n")
+
     def initialize_state(self, w: Array) -> Array:
         """Initialize the state with momentum buffer and step counter."""
         print("\n[DEBUG] >>> initialize_state called <<<")
-        # 1. Capire che cosa è w
-        print("[DEBUG] type(w):", type(w))
 
-        # 2. Stampiamo struttura del pytree w: nome → shape
-        def debug_print_param(p, name=""):
-            print(f"[DEBUG] param: {name:30s} shape={tuple(p.shape)} dim={p.dim()} dtype={p.dtype} device={p.device}")
-            return p
+        assert hasattr(self, "_shapes"), (
+            "You should call Muon.bind_model_structure(model) before initialize_state"
+        )
 
-        # tree_map_with_names non esiste, quindi facciamo così:
-        from src.utils import tree_flatten_with_names
-        flat, structure = tree_flatten_with_names(w)
-        print("[DEBUG] Found", len(flat), "parameters:")
-        for name, tensor in flat.items():
-            debug_print_param(tensor, name)
+        momenta_chunks = []
+        for name, shape, size, offset in zip(self._names, self._shapes, self._sizes, self._offsets):
+            # * Get the portion of w corresponding to this parameters
+            param_flat = w[offset: offset + size]
+            param = param_flat.view(shape)
 
-        def init_momentum(p):
-            if p.dim() == 2:
-                print(f"[DEBUG] Initializing Muon momentum for matrix: shape={p.shape}")
-                return torch.zeros_like(p)  # Muon momentum (this is a matrix)
+            # * Distinguish between Muon and non-Muon parameters (although they all get 0 momentum init)
+            if param.dim() == 2:
+                print(f"[DEBUG] Initializing Muon momentum for MATRIX {name}: shape={shape}")
+                m = torch.zeros_like(param)   # momentum matrix Muon (all 0 init)
             else:
-                print(f"[DEBUG] Initializing NON-Muon momentum for param (dim={p.dim()}) shape={p.shape}")
-                return torch.zeros_like(p)  # maybe momentum or None (for biases, 1D vectors)
+                print(f"[DEBUG] Initializing NON-Muon momentum for {name}: shape={shape}")
+                m = torch.zeros_like(param)   # normal momentum vector (all 0 init)
 
-        state = {
-            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
-            "m": tree_map(init_momentum, w),
-        }
-        flat_state, self.unflatten = flatten_pytree(state)
+            momenta_chunks.append(m.reshape(-1)) # * flatten and store
+
+        m_flat = torch.cat(momenta_chunks)
+        t = torch.tensor(0.0, dtype=w.dtype, device=w.device)
+
+        flat_state = torch.cat([m_flat, t.view(1)])
         print("[DEBUG] flat_state shape:", flat_state.shape)
-        print("[DEBUG] initialize_state completed\n")
+        print("[DEBUG] >>> initialize_state completed <<<\n")
         return flat_state
     
     def _zeropower_via_newtonschulz5(self, G: torch.Tensor) -> torch.Tensor:
@@ -395,17 +425,10 @@ class Muon(UpdateRule):
         
         return X.to(original_dtype)
 
-    def P(self, flat_state: Array) -> Preconditioner:
-        """
-        The preconditioner of Muon is complex and non-diagonal.
-        It combines weight normalization and gradient whitening.
-        
-        For simplicity, we return a scalar diagonal preconditioner 1/η
-        since whitening is handled internally in update().
-        """
-        state = self.unflatten(flat_state)
-        lr = self.lr_fn(state["t"])
-        return DiagonalPreconditioner(1 / lr)
+    def P(self, flat_state):
+        # Just return identity-scaling preconditioner
+        lr = self.lr_fn(flat_state[-1])
+        return DiagonalPreconditioner(torch.full_like(flat_state[:-1], 1.0 / lr))
     
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         """Updates momentum buffer and step counter."""
@@ -418,48 +441,45 @@ class Muon(UpdateRule):
         state = {"t": t + 1.0, "m": m}
         return flatten_pytree(state)[0]
 
-    def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
-        """
-        Complete update of Muon with weight normalization and gradient whitening.
-        
-        This override is necessary because Muon does not follow the standard formula
-        w_{t+1} = w_t - P^{-1} g_t
-        """
-        state = self.unflatten(flat_state)
-        t, m = state["t"], state["m"]
-        lr = self.lr_fn(t)
-        
-        # 1. Update momentum buffer
-        m = self.momentum * m + gradient
-        
-        # 2. Apply Nesterov if requested
-        if self.nesterov:
-            effective_grad = gradient + self.momentum * m
-        else:
-            effective_grad = m
-        
-        # 3. Weight normalization: w ← w · √d / ||w||
-        d = torch.tensor(len(w), dtype=w.dtype, device=w.device)
-        w_norm = w.norm()
-        w = w * (torch.sqrt(d) / (w_norm + self.eps))
-        
-        # 4. Gradient whitening via Newton-Schulz
-        # Reshape as matrix (first_dim, -1)
-        first_dim = effective_grad.size(0) if effective_grad.dim() > 1 else 1
-        grad_matrix = effective_grad.reshape(first_dim, -1)
-        
-        # Apply whitening
-        whitened_matrix = self._zeropower_via_newtonschulz5(grad_matrix)
-        whitened_grad = whitened_matrix.view(effective_grad.shape)
-        
-        # 5. Apply update
-        w = w - lr * whitened_grad
-        
-        # Update state
-        new_state = {"t": t + 1.0, "m": m}
-        flat_state = flatten_pytree(new_state)[0]
-        
-        return w, flat_state
+    def update(self, w, state, grad):
+        # 1. split state
+        m_flat = state[:-1]
+        t = state[-1]
+
+        # 2. ricostruisci momentum e gradient chunk per chunk
+        new_m_chunks = []
+        new_w_chunks = []
+
+        idx = 0
+        for name, shape, size, offset in zip(self._names, self._shapes, self._sizes, self._offsets):
+            w_chunk = w[offset: offset+size].view(shape)
+            g_chunk = grad[offset: offset+size].view(shape)
+            m_chunk = m_flat[offset: offset+size].view(shape)
+
+            if w_chunk.dim() == 2:
+                # --- Muon update ---
+                U = self._zeropower_via_newtonschulz5(g_chunk)
+
+                m_new = beta * m_chunk + (1 - beta) * U
+                w_new = w_chunk - lr * m_new
+
+            else:
+                # --- normal momentum ---
+                m_new = beta * m_chunk + (1 - beta) * g_chunk
+                w_new = w_chunk - lr * m_new
+
+            new_m_chunks.append(m_new.reshape(-1))
+            new_w_chunks.append(w_new.reshape(-1))
+
+        # 3. ricombina tutto
+        new_m_flat = torch.cat(new_m_chunks)
+        new_w_flat = torch.cat(new_w_chunks)
+
+        # 4. nuovo step counter
+        new_t = t + 1
+
+        new_state = torch.cat([new_m_flat, new_t.view(1)])
+        return new_w_flat, new_state
 
     def dstate_dt(self, flat_state: Array, gradient: Array) -> Array:
         """

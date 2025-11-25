@@ -100,6 +100,10 @@ def main(
     
     # make the model functional. 'model_fn' is a functional version of the network; 'w' are the initial weights
     w, model_fn = FunctionalModel.make_functional(model)
+
+    # * This function binds the model structure to the Muon optimizer
+    if isinstance(opt, Muon):
+        opt.bind_model_structure(model)
     
     # initialize optimizer state
     state = opt.initialize_state(w) 
