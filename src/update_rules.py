@@ -298,22 +298,17 @@ class RMSProp(UpdateRule):
 
 @dataclass
 class Muon(UpdateRule):
-    """Muon optimizer with momentum, weight normalization and gradient whitening.
+    """
+    Muon optimizer with momentum, weight normalization and gradient whitening.
     
-    Muon combines:
-    1. Momentum (optional Nesterov)
-    2. Weight normalization: keeps weights on a sphere
-    3. Gradient whitening via Newton-Schulz iteration
-    
-    The algorithm is:
-        m_t = β m_{t-1} + ∇L(w_t)
-        g_t = m_t + β m_t  (if Nesterov, otherwise g_t = m_t)
-        w_t = w_t · √d / ||w_t||  (normalization)
-        Δ = ZeroPower(g_t)  (whitening)
-        w_{t+1} = w_t - η Δ
-    
-    N.B.: The whitening reshapes the gradient as a matrix (first_dim, -1) and applies
-    Newton-Schulz to approximate UV^T of the SVD.
+    State Structure (Flat):
+        The state is stored as a flat tensor: [m_flat | t]
+        - m_flat: momentum buffer, same size as weights (size: len(w))
+        - t: step counter (size: 1)
+        
+    Note: Unlike other optimizers (GradientDescent, RMSProp), Muon uses a
+    flat state representation instead of pytree for performance reasons,
+    as Muon's update involves expensive Newton-Schulz iterations.
     """
 
     lr: float
@@ -345,6 +340,12 @@ class Muon(UpdateRule):
         self._names = [name for name, _ in params]
         self._shapes = [p.shape for _, p in params]
         self._sizes = [p.numel() for _, p in params]
+        self._is_matrix = [len(shape) == 2 for shape in self._shapes]
+
+        print("[DEBUG] Parameters that will use Newton-Schulz whitening:")
+        for name, is_mat in zip(self._names, self._is_matrix):
+            marker = "✓" if is_mat else "✗"
+            print(f"[DEBUG]   {marker} {name}")
 
         print("[DEBUG] sizes:", self._sizes)
 
@@ -359,7 +360,12 @@ class Muon(UpdateRule):
         print("[DEBUG] Done binding model structure\n")
 
     def initialize_state(self, w: Array) -> Array:
-        """Initialize the state with momentum buffer and step counter."""
+        """
+        Returns flat state with structure: [m_flat | t]
+        - m_flat: momentum buffer (size: len(w))
+        - t: step counter (size: 1)
+        """
+
         print("\n[DEBUG] >>> initialize_state called <<<")
 
         assert hasattr(self, "_shapes"), (
@@ -386,6 +392,17 @@ class Muon(UpdateRule):
         t = torch.tensor(0.0, dtype=w.dtype, device=w.device)
 
         flat_state = torch.cat([m_flat, t.view(1)])
+
+        # * ASSERT check
+        expected_size = len(w) + 1  # momentum + step counter
+        actual_size = len(flat_state)
+        assert actual_size == expected_size, (
+            f"State size mismatch: expected {expected_size}, got {actual_size}"
+        )
+
+        assert len(m_flat) == len(w), (
+            f"Momentum buffer size mismatch: expected {len(w)}, got {len(m_flat)}"
+        )
         print("[DEBUG] flat_state shape:", flat_state.shape)
         print("[DEBUG] >>> initialize_state completed <<<\n")
         return flat_state
@@ -399,7 +416,9 @@ class Muon(UpdateRule):
 
         This implementation is taken from CIFAR10-muon repo.
         """
-        assert len(G.shape) == 2
+        assert len(G.shape) == 2, f"Expected 2D tensor, got shape {G.shape}"
+        assert not torch.isnan(G).any(), "Input contains NaN"
+        assert not torch.isinf(G).any(), "Input contains Inf"
         a, b, c = (3.4445, -4.7750, 2.0315)
         
         # Work in bfloat16 for speed (if supported)
@@ -408,6 +427,8 @@ class Muon(UpdateRule):
         
         # Normalize to ensure top singular value <= 1
         X = X / (X.norm() + self.eps)
+
+        print(f"    [Newton-Schulz] Input shape={G.shape}, norm={G_norm:.4f}")
         
         # Transpose if necessary (work on smaller dimension)
         transposed = G.size(0) > G.size(1)
@@ -423,108 +444,224 @@ class Muon(UpdateRule):
         if transposed:
             X = X.T
         
+        assert not torch.isnan(X).any(), "Newton-Schulz produced NaN"
+        assert not torch.isinf(X).any(), "Newton-Schulz produced Inf"
         return X.to(original_dtype)
+
+    def _extract_state(self, flat_state: Array) -> Tuple[Array, torch.Tensor]:
+        """Extract momentum and step counter from flat state."""
+        assert len(flat_state) > 1, (
+            f"State too small: expected at least 2 elements, got {len(flat_state)}"
+        )
+        m = flat_state[:-1]  # * All but last element (momentum buffer)
+        t = flat_state[-1]    # * Last element (step counter)
+
+        assert t.numel() == 1, f"Step counter should be scalar, got shape {t.shape}"
+        if hasattr(self, "_total_size"):  # _total_size viene da bind_model_structure
+            assert len(m) == self._total_size, (
+                f"Momentum size mismatch: expected {self._total_size}, got {len(m)}"
+            )
+        return m, t
 
     def P(self, flat_state):
         # Just return identity-scaling preconditioner
-        lr = self.lr_fn(flat_state[-1])
-        return DiagonalPreconditioner(torch.full_like(flat_state[:-1], 1.0 / lr))
+        _, t = self._extract_state(flat_state)
+        lr = self.lr_fn(t)
+        return DiagonalPreconditioner(1.0 / lr)
     
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
-        """Updates momentum buffer and step counter."""
-        state = self.unflatten(flat_state)
-        t, m = state["t"], state["m"]
+        """
+        Update ONLY the state (momentum + step counter).
+        This follows the standard template.
+        """
+        m, t = self._extract_state(flat_state)
+        assert len(m) == len(gradient), (
+            f"Momentum and gradient size mismatch: m={len(m)}, grad={len(gradient)}"
+        )
         
-        # Update momentum buffer: m_t = β m_{t-1} + g_t
+        # * Standard momentum update: m = β*m + g
+        m_old_norm = m.norm().item()
+        m = self.momentum * m + gradient
+        m_new_norm = m.norm().item()
+
+        print(f"[update_state] t={t.item():.0f}, ||m_old||={m_old_norm:.4f}, "
+              f"||m_new||={m_new_norm:.4f}, ||grad||={gradient.norm().item():.4f}")
+        
+        # * Increment step counter
+        t = t + 1.0
+        
+        # * Reconstruct flat state
+        new_state = torch.cat([m, t.view(1)])
+        return new_state
+
+    # ^ Override update method to implement Muon-specific update (other optimizers do not do this)
+    def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
+        """
+        Complete Muon update with weight normalization and gradient whitening.
+        
+        This OVERRIDES the base class update() because Muon doesn't follow
+        the standard formula w = w - P^{-1}(gradient).
+        """
+        assert hasattr(self, "_is_matrix"), (
+            "Missing _is_matrix attribute. Did you call bind_model_structure()?"
+        )
+        assert len(w) == len(gradient), (
+            f"Weight and gradient size mismatch: w={len(w)}, grad={len(gradient)}"
+        )
+        m, t = self._extract_state(flat_state)
+        lr = self.lr_fn(t)
+
+        print(f"\n[update] Step {t.item():.0f}, lr={lr:.6f}")
+        
+        # * Update momentum buffer: m = β*m + g
         m = self.momentum * m + gradient
         
-        state = {"t": t + 1.0, "m": m}
-        return flatten_pytree(state)[0]
+        # * Compute effective gradient (with Nesterov if requested)
+        if self.nesterov:
+            effective_grad = gradient + self.momentum * m
+        else:
+            effective_grad = m
+        
+        # * Process each parameter based on dimensionality
+        w_chunks = []
+        grad_chunks = []
+        
+        for offset, size, shape, is_matrix in zip(
+            self._offsets, self._sizes, self._shapes, self._is_matrix
+        ):
+            # Extract parameter and gradient chunks
+            w_chunk = w[offset:offset+size].view(shape)
+            g_chunk = effective_grad[offset:offset+size].view(shape)
 
-    def update(self, w, state, grad):
-        # 1. split state
-        m_flat = state[:-1]
-        t = state[-1]
+            if i < 3 or is_matrix:  # Mostra i primi 3 o tutti i matrix
+                print(f"[update]   Param {i}: name={self._names[i]}, "
+                    f"shape={shape}, is_matrix={is_matrix}, "
+                    f"||w||={w_chunk.norm().item():.4f}, "
+                    f"||g||={g_chunk.norm().item():.4f}")
+            
+            if is_matrix:
+                # ? === MUON UPDATE FOR 2D MATRICES ===
 
-        # 2. ricostruisci momentum e gradient chunk per chunk
-        new_m_chunks = []
-        new_w_chunks = []
+                assert len(shape) == 2, f"is_matrix=True but shape={shape}"
+                
+                # Weight normalization: w ← w · √d / ||w||
+                d = torch.tensor(size, dtype=w.dtype, device=w.device)
+                w_norm = w_chunk.norm()
+                w_chunk = w_chunk * (torch.sqrt(d) / (w_norm + self.eps))
 
-        idx = 0
-        for name, shape, size, offset in zip(self._names, self._shapes, self._sizes, self._offsets):
-            w_chunk = w[offset: offset+size].view(shape)
-            g_chunk = grad[offset: offset+size].view(shape)
-            m_chunk = m_flat[offset: offset+size].view(shape)
+                assert w_norm > self.eps, (
+                    f"Weight norm too small for param {self._names[i]}: {w_norm}"
+                )
 
-            if w_chunk.dim() == 2:
-                # --- Muon update ---
-                U = self._zeropower_via_newtonschulz5(g_chunk)
+                new_norm = w_chunk.norm().item()
+                expected_norm = torch.sqrt(d).item()
+                if abs(new_norm - expected_norm) > 0.1 * expected_norm:
+                    print(f"[WARNING] Normalization check failed for {self._names[i]}: "
+                        f"expected ||w||≈{expected_norm:.2f}, got {new_norm:.2f}")
+                
+                # Gradient whitening via Newton-Schulz
+                g_whitened = self._zeropower_via_newtonschulz5(g_chunk)
 
-                m_new = beta * m_chunk + (1 - beta) * U
-                w_new = w_chunk - lr * m_new
-
+                # * Sanity check for NaNs
+                if torch.isnan(g_whitened).any():
+                    raise ValueError(f"NaN detected in whitened gradient for {self._names[i]}")
+                
             else:
-                # --- normal momentum ---
-                m_new = beta * m_chunk + (1 - beta) * g_chunk
-                w_new = w_chunk - lr * m_new
-
-            new_m_chunks.append(m_new.reshape(-1))
-            new_w_chunks.append(w_new.reshape(-1))
-
-        # 3. ricombina tutto
-        new_m_flat = torch.cat(new_m_chunks)
-        new_w_flat = torch.cat(new_w_chunks)
-
-        # 4. nuovo step counter
-        new_t = t + 1
-
-        new_state = torch.cat([new_m_flat, new_t.view(1)])
-        return new_w_flat, new_state
+                # ? === STANDARD UPDATE FOR 1D VECTORS (biases) ===
+                # No normalization, no whitening
+                g_whitened = g_chunk
+            
+            # Store processed chunks
+            w_chunks.append(w_chunk.reshape(-1))
+            grad_chunks.append(g_whitened.reshape(-1))
+        
+        # * Concatenate all parameters
+        w = torch.cat(w_chunks)
+        whitened_grad = torch.cat(grad_chunks)
+        
+        # * Apply update: w = w - lr * whitened_grad
+        w = w - lr * whitened_grad
+        
+        # * Update state (momentum + step counter)
+        new_state = torch.cat([m, (t + 1.0).view(1)])
+        
+        return w, new_state
 
     def dstate_dt(self, flat_state: Array, gradient: Array) -> Array:
         """
-        Temporal derivative of the state for continuous flows.
-        
-        For momentum: dm/dt = (g - m) / β_scaled
-        where β_scaled accounts for discretization.
+        Temporal derivative of state for continuous flows.
         """
-        state = self.unflatten(flat_state)
-        m = state["m"]
+        m, t = self._extract_state(flat_state)
+        assert len(m) == len(gradient), (
+            f"Momentum and gradient size mismatch in dstate_dt"
+        )
         
-        # Derivative of the momentum buffer (see paper for details)
-        dmdt = (gradient - m) / (1 - self.momentum) if self.momentum < 1 else gradient
+        # Continuous-time momentum derivative
+        if self.momentum < 1:
+            dmdt = (gradient - m) / (1 - self.momentum)
+        else:
+            dmdt = gradient
+
+        print(f"[dstate_dt] t={t.item():.0f}, "
+              f"||dmdt||={dmdt.norm().item():.4f}, "
+              f"||grad||={gradient.norm().item():.4f}")
         
-        new_state = {"t": torch.ones_like(state["t"]), "m": dmdt}
-        return flatten_pytree(new_state)[0]
+        # dt/dt = 1
+        dtdt = torch.tensor(1.0, dtype=t.dtype, device=t.device)
+        
+        # Reconstruct derivative
+        dstate = torch.cat([dmdt, dtdt.view(1)])
+
+        assert len(dstate) == len(flat_state), (
+            f"dstate_dt output size mismatch: expected {len(flat_state)}, got {len(dstate)}"
+        )
+        return dstate
 
     def summarize_state(self, flat_state: Array) -> Dict[str, Any]:
-        """Summary of the state for logging."""
-        state = self.unflatten(flat_state)
-        m = state["m"]
+        """Summary of state for logging."""
+        m, t = self._extract_state(flat_state)
+
+        assert hasattr(self, "_offsets"), (
+            "summarize_state requires bind_model_structure() to be called first"
+        )
         
-        # Statistics on the momentum buffer
-        m_norm = m.norm()
-        m_mean = m.mean()
-        m_std = m.std()
+        # Compute statistics per parameter type
+        m_matrix_norm_sq = 0.0
+        m_bias_norm_sq = 0.0
+        n_matrix = 0
+        n_bias = 0
+        
+        for offset, size, is_matrix in zip(self._offsets, self._sizes, self._is_matrix):
+            m_chunk = m[offset:offset+size]
+            if is_matrix:
+                m_matrix_norm_sq += m_chunk.norm().item()**2
+                n_matrix += 1
+            else:
+                m_bias_norm_sq += m_chunk.norm().item()**2
+                n_bias += 1
+
+        expected_params = len(self._offsets)
+        actual_params = n_matrix + n_bias
+        assert actual_params == expected_params, (
+            f"Processed {actual_params} params but expected {expected_params}"
+        )
         
         return {
-            "t": state["t"],
-            "lr": self.lr_fn(state["t"]),
-            "momentum_norm": m_norm,
-            "momentum_mean": m_mean,
-            "momentum_std": m_std,
+            "t": t.item(),
+            "lr": self.lr_fn(t),
+            "momentum_norm": m.norm().item(),
+            "momentum_matrix_norm": torch.sqrt(torch.tensor(m_matrix_norm_sq)).item() if n_matrix > 0 else 0.0,
+            "momentum_bias_norm": torch.sqrt(torch.tensor(m_bias_norm_sq)).item() if n_bias > 0 else 0.0,
+            "n_matrix_params": n_matrix, # * for debugging
+            "n_bias_params": n_bias,     # * for debugging
         }
 
     def raw_eigs_from_eigs(self, flat_state: Array, eigs: Array):
-        """
-        Transform effective Hessian eigenvalues into raw eigenvalues.
-        
-        For Muon this is complex because the preconditioner is not diagonal.
-        For now we use a simple approximation.
-        """
+        """Transform effective Hessian eigenvalues to raw eigenvalues."""
         if eigs is None:
             return None
-        lr = self.P(flat_state).pow(-1)(1.0)
+        _, t = self._extract_state(flat_state)
+        lr = self.lr_fn(t)
         return eigs / lr
 
 
