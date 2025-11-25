@@ -6,3 +6,6 @@ requirements.txt
 .DS_Store
 .venv
 .vscode
+
+logs/
+run_euler.sh

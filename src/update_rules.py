@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from .utils import flatten_pytree
+from torch.utils._pytree import tree_map
 
 
 Array = Any
@@ -294,6 +295,217 @@ class RMSProp(UpdateRule):
             "ess_harmonic_mean": ess.reciprocal().mean().reciprocal(),
             "lr": self.lr_fn(state["t"]), # current learning rate
         }
+
+@dataclass
+class Muon(UpdateRule):
+    """Muon optimizer with momentum, weight normalization and gradient whitening.
+    
+    Muon combines:
+    1. Momentum (optional Nesterov)
+    2. Weight normalization: keeps weights on a sphere
+    3. Gradient whitening via Newton-Schulz iteration
+    
+    The algorithm is:
+        m_t = β m_{t-1} + ∇L(w_t)
+        g_t = m_t + β m_t  (if Nesterov, otherwise g_t = m_t)
+        w_t = w_t · √d / ||w_t||  (normalization)
+        Δ = ZeroPower(g_t)  (whitening)
+        w_{t+1} = w_t - η Δ
+    
+    N.B.: The whitening reshapes the gradient as a matrix (first_dim, -1) and applies
+    Newton-Schulz to approximate UV^T of the SVD.
+    """
+
+    lr: float
+    momentum: float
+    nesterov: bool = True
+    ns_steps: int = 3 # Newton-Schulz steps
+    eps: float = 1e-7 # for numerical stability
+
+    def __post_init__(self):
+        self.lr_fn = to_schedule(self.lr)
+
+    def initialize_state(self, w: Array) -> Array:
+        """Initialize the state with momentum buffer and step counter."""
+        print("\n[DEBUG] >>> initialize_state called <<<")
+        # 1. Capire che cosa è w
+        print("[DEBUG] type(w):", type(w))
+
+        # 2. Stampiamo struttura del pytree w: nome → shape
+        def debug_print_param(p, name=""):
+            print(f"[DEBUG] param: {name:30s} shape={tuple(p.shape)} dim={p.dim()} dtype={p.dtype} device={p.device}")
+            return p
+
+        # tree_map_with_names non esiste, quindi facciamo così:
+        from src.utils import tree_flatten_with_names
+        flat, structure = tree_flatten_with_names(w)
+        print("[DEBUG] Found", len(flat), "parameters:")
+        for name, tensor in flat.items():
+            debug_print_param(tensor, name)
+
+        def init_momentum(p):
+            if p.dim() == 2:
+                print(f"[DEBUG] Initializing Muon momentum for matrix: shape={p.shape}")
+                return torch.zeros_like(p)  # Muon momentum (this is a matrix)
+            else:
+                print(f"[DEBUG] Initializing NON-Muon momentum for param (dim={p.dim()}) shape={p.shape}")
+                return torch.zeros_like(p)  # maybe momentum or None (for biases, 1D vectors)
+
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+            "m": tree_map(init_momentum, w),
+        }
+        flat_state, self.unflatten = flatten_pytree(state)
+        print("[DEBUG] flat_state shape:", flat_state.shape)
+        print("[DEBUG] initialize_state completed\n")
+        return flat_state
+    
+    def _zeropower_via_newtonschulz5(self, G: torch.Tensor) -> torch.Tensor:
+        """
+        Newton-Schulz iteration to calculate the zeroth power / orthogonalization of G.
+        
+        Approximates UV^T where USV^T = G is the SVD, but much faster.
+        The coefficients are optimized to maximize the slope at zero.
+
+        This implementation is taken from CIFAR10-muon repo.
+        """
+        assert len(G.shape) == 2
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        
+        # Work in bfloat16 for speed (if supported)
+        original_dtype = G.dtype
+        X = G.to(torch.bfloat16) if torch.cuda.is_bf16_supported() else G
+        
+        # Normalize to ensure top singular value <= 1
+        X = X / (X.norm() + self.eps)
+        
+        # Transpose if necessary (work on smaller dimension)
+        transposed = G.size(0) > G.size(1)
+        if transposed:
+            X = X.T
+        
+        # Newton-Schulz iteration (quintic)
+        for _ in range(self.ns_steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        
+        if transposed:
+            X = X.T
+        
+        return X.to(original_dtype)
+
+    def P(self, flat_state: Array) -> Preconditioner:
+        """
+        The preconditioner of Muon is complex and non-diagonal.
+        It combines weight normalization and gradient whitening.
+        
+        For simplicity, we return a scalar diagonal preconditioner 1/η
+        since whitening is handled internally in update().
+        """
+        state = self.unflatten(flat_state)
+        lr = self.lr_fn(state["t"])
+        return DiagonalPreconditioner(1 / lr)
+    
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        """Updates momentum buffer and step counter."""
+        state = self.unflatten(flat_state)
+        t, m = state["t"], state["m"]
+        
+        # Update momentum buffer: m_t = β m_{t-1} + g_t
+        m = self.momentum * m + gradient
+        
+        state = {"t": t + 1.0, "m": m}
+        return flatten_pytree(state)[0]
+
+    def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
+        """
+        Complete update of Muon with weight normalization and gradient whitening.
+        
+        This override is necessary because Muon does not follow the standard formula
+        w_{t+1} = w_t - P^{-1} g_t
+        """
+        state = self.unflatten(flat_state)
+        t, m = state["t"], state["m"]
+        lr = self.lr_fn(t)
+        
+        # 1. Update momentum buffer
+        m = self.momentum * m + gradient
+        
+        # 2. Apply Nesterov if requested
+        if self.nesterov:
+            effective_grad = gradient + self.momentum * m
+        else:
+            effective_grad = m
+        
+        # 3. Weight normalization: w ← w · √d / ||w||
+        d = torch.tensor(len(w), dtype=w.dtype, device=w.device)
+        w_norm = w.norm()
+        w = w * (torch.sqrt(d) / (w_norm + self.eps))
+        
+        # 4. Gradient whitening via Newton-Schulz
+        # Reshape as matrix (first_dim, -1)
+        first_dim = effective_grad.size(0) if effective_grad.dim() > 1 else 1
+        grad_matrix = effective_grad.reshape(first_dim, -1)
+        
+        # Apply whitening
+        whitened_matrix = self._zeropower_via_newtonschulz5(grad_matrix)
+        whitened_grad = whitened_matrix.view(effective_grad.shape)
+        
+        # 5. Apply update
+        w = w - lr * whitened_grad
+        
+        # Update state
+        new_state = {"t": t + 1.0, "m": m}
+        flat_state = flatten_pytree(new_state)[0]
+        
+        return w, flat_state
+
+    def dstate_dt(self, flat_state: Array, gradient: Array) -> Array:
+        """
+        Temporal derivative of the state for continuous flows.
+        
+        For momentum: dm/dt = (g - m) / β_scaled
+        where β_scaled accounts for discretization.
+        """
+        state = self.unflatten(flat_state)
+        m = state["m"]
+        
+        # Derivative of the momentum buffer (see paper for details)
+        dmdt = (gradient - m) / (1 - self.momentum) if self.momentum < 1 else gradient
+        
+        new_state = {"t": torch.ones_like(state["t"]), "m": dmdt}
+        return flatten_pytree(new_state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Dict[str, Any]:
+        """Summary of the state for logging."""
+        state = self.unflatten(flat_state)
+        m = state["m"]
+        
+        # Statistics on the momentum buffer
+        m_norm = m.norm()
+        m_mean = m.mean()
+        m_std = m.std()
+        
+        return {
+            "t": state["t"],
+            "lr": self.lr_fn(state["t"]),
+            "momentum_norm": m_norm,
+            "momentum_mean": m_mean,
+            "momentum_std": m_std,
+        }
+
+    def raw_eigs_from_eigs(self, flat_state: Array, eigs: Array):
+        """
+        Transform effective Hessian eigenvalues into raw eigenvalues.
+        
+        For Muon this is complex because the preconditioner is not diagonal.
+        For now we use a simple approximation.
+        """
+        if eigs is None:
+            return None
+        lr = self.P(flat_state).pow(-1)(1.0)
+        return eigs / lr
 
 
 class Preconditioner:

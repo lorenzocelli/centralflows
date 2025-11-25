@@ -225,6 +225,43 @@ def get_upper_to_mat_metric(k: int) -> Array:
     ).cuda()  # metric[i,j] = 2 if i != j else 1
     return mat_to_upper(metric)  # convert to upper triangular form
 
+def tree_flatten_with_names(pytree, prefix=""):
+    """
+    Flatten a pytree into an ordered dict {path_string: tensor}.
+    
+    Args:
+        pytree: any pytree structure (dict, list, tuple, tensor)
+        prefix: path prefix used internally during recursion
+
+    Returns:
+        flat: OrderedDict mapping unique names -> tensors
+        treedef: same treedef returned by tree_flatten (optional to save)
+    """
+
+    from collections import OrderedDict
+
+    flat = OrderedDict()
+
+    if torch.is_tensor(pytree):
+        # Leaf tensor
+        flat[prefix.rstrip("/")] = pytree
+        return flat
+
+    elif isinstance(pytree, dict):
+        for key, subtree in pytree.items():
+            name = f"{prefix}{key}/"
+            flat.update(tree_flatten_with_names(subtree, name))
+        return flat
+
+    elif isinstance(pytree, (list, tuple)):
+        for idx, subtree in enumerate(pytree):
+            name = f"{prefix}{idx}/"
+            flat.update(tree_flatten_with_names(subtree, name))
+        return flat
+
+    else:
+        raise TypeError(f"Unsupported pytree leaf type: {type(pytree)}")
+
 
 class Timer:
     def __init__(self):

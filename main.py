@@ -30,7 +30,7 @@ from src.processes import (
     EigConfig
 )
 from src.saving import Checkpointer, DataSaver, LoadOptions
-from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp
+from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp, Muon
 from src.utils import convert_dataclasses
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -43,6 +43,7 @@ ValidOpt = Union[
     Annotated[GradientDescent, subcommand("gd")],
     Annotated[ScalarRMSProp, subcommand("scalar_rmsprop")],
     Annotated[RMSProp, subcommand("rmsprop")],
+    Annotated[Muon, subcommand("muon")],
 ]
 ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification]#, FlattenedMNIST, SparseParity]
 ValidArch = Union[CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet]
