@@ -309,6 +309,37 @@ class RMSProp(UpdateRule):
             "lr": self.lr_fn(state["t"]), # current learning rate
         }
 
+@dataclass # we make it a dataclass so that it can be instantiated from the command line
+class Muon(UpdateRule):
+    """A placeholder for the Muon optimizer."""
+
+    # ! TODO IMPLEMENT MUON OPTIMIZER
+    
+    lr: float  # the learning rate
+
+    def __post_init__(self):
+        self.lr_fn = to_schedule(self.lr)
+
+    def initialize_state(self, w: Array) -> Array:
+        state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
+        flat_state, self.unflatten = flatten_pytree(state)
+        return flat_state
+
+    def P(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]))
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        state = self.unflatten(flat_state)
+        state = {"t": state["t"] + 1.0}
+        return flatten_pytree(state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        return {
+            "t": state["t"],
+            "lr": self.lr_fn(state["t"]),
+        }
 
 class Preconditioner:
     """Abstract class for a preconditioner."""

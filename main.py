@@ -31,8 +31,8 @@ from src.processes import (
     EigConfig
 )
 from src.saving import Checkpointer, DataSaver, LoadOptions
-from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp
-from src.utils import convert_dataclasses
+from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp, Muon
+from src.utils import convert_dataclasses, create_all_layer_masks, print_layer_masks, flatten_pytree
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 torch.backends.cudnn.allow_tf32 = False
@@ -44,6 +44,7 @@ ValidOpt = Union[
     Annotated[GradientDescent, subcommand("gd")],
     Annotated[ScalarRMSProp, subcommand("scalar_rmsprop")],
     Annotated[RMSProp, subcommand("rmsprop")],
+    Annotated[Muon, subcommand("muon")]
 ]
 ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification]#, FlattenedMNIST, SparseParity]
 ValidArch = Union[CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet]
@@ -101,12 +102,50 @@ def main(
     # make the model functional. 'model_fn' is a functional version of the network; 'w' are the initial weights
     w, model_fn = FunctionalModel.make_functional(model)
 
+    print("\n=== Parameter Structure ===")
+    params_dict = model_fn.unflatten(w)
+
+    def print_param_structure(d, prefix=''):
+        """Recursively print parameter names and shapes."""
+        for key, value in d.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, torch.Tensor):
+                shape_str = str(tuple(value.shape))
+                print(f"{full_key:50s} shape={shape_str:<20s} numel={value.numel():8d}")
+            elif isinstance(value, dict):
+                print_param_structure(value, full_key)
+
+    print_param_structure(params_dict)
+    print("=" * 80 + "\n")
+
+    masks = create_all_layer_masks(w, model_fn)
+    print_layer_masks(masks, params_dict)
+
     # TODO: allow configuring the optimizer from command line
-    opt = GradientDescent(lr=1e-2)
-    state = opt.initialize_state(w, model_fn.unflatten)
-    groups = {
-        "gd": WeightGroup(opt=opt, state=state, mask=torch.ones_like(w, dtype=torch.bool))
-    }
+    groups = {}
+
+    for mask_name, mask_dict in masks.items():
+        flat_mask, _ = flatten_pytree(mask_dict)
+
+        # Verify the flattened mask has the same shape as w
+        assert flat_mask.shape == w.shape, f"Mask {mask_name} shape {flat_mask.shape} != w shape {w.shape}"
+
+        if mask_name == "1d_params":
+            # Use GradientDescent for 1D parameters (biases, norms, etc.)
+            opt = GradientDescent(lr=1e-2)
+            state = opt.initialize_state(w)
+            groups[mask_name] = WeightGroup(opt=opt, state=state, mask=flat_mask)
+        else:
+            # Use Muon for 2D parameters (weight matrices)
+            opt = Muon(lr=0.02)  # Usa i parametri appropriati per Muon
+            state = opt.initialize_state(w)
+            groups[mask_name] = WeightGroup(opt=opt, state=state, mask=flat_mask)
+    
+    print(f"\n=== Created {len(groups)} Weight Groups ===")
+    for name, group in groups.items():
+        num_params = group.mask.sum().item()
+        print(f"  {name:20s} | optimizer: {type(group.opt).__name__:20s} | params: {num_params:8,}")
+    print("=" * 80 + "\n")
     
     # put together loss function
     loss_fn = SupervisedLossFunction(
