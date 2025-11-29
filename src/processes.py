@@ -550,6 +550,7 @@ class EigManager:
     def __init__(self, loss_fn: LossFunction, w_example: Array, mask: Array, config: EigConfig):
         self.loss_fn = loss_fn
         self.config = config
+        self.mask = mask
         
         # this counter increments upon each call to .get()
         self.counter = 0
@@ -585,7 +586,7 @@ class EigManager:
         # eigenvalues of the effective Hessian. 
         else:
             symU = self.cache["symU"]
-            hessian_diag = vmap(lambda u: self.loss_fn.D(w, 2, P_inv_sqrt(u), P_inv_sqrt(u)), 1)(symU)
+            hessian_diag = vmap(lambda u: self.loss_fn.D_masked(w, self.mask, 2, P_inv_sqrt(u), P_inv_sqrt(u)), 1)(symU)
             # TODO do we really need this?
             order = torch.argsort(hessian_diag, descending=True)
             eigs, symU = hessian_diag[order], symU[:, order]
