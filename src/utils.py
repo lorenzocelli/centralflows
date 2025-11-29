@@ -247,167 +247,75 @@ class TimingContext:
             torch.cuda.synchronize()
         self.times_dict[self.name] = time.time() - self.start
 
-def create_mask_template(params_dict):
-    """
-    Create a template mask with all zeros (all parameters inactive).
-    
-    Args:
-        params_dict: flat dict of parameters from model_fn.unflatten(w)
-        
-    Returns:
-        dict: mask dict with same structure as params_dict, all zeros
-    """
-    mask_dict = {}
-    for key, value in params_dict.items():
-        mask_dict[key] = torch.zeros_like(value, dtype=torch.bool)
-    return mask_dict
 
-
-def create_layer_mask(params_dict, target_layer_name):
+def create_layers_mask(activate_params, params_dict):
     """
-    Create a mask for a specific layer.
-    
-    If target_layer is 2D (weight matrix), only that layer is activated (all 1s).
-    If target_layer is 1D (bias, norm, etc.), ALL 1D parameters are activated.
-    
+    Create a mask for a set of layers.
+
     Args:
+        activate_params: list of parameter names to activate
         params_dict: flat dict of parameters from model_fn.unflatten(w)
-        target_layer_name: name of the layer to create mask for (e.g., "1.weight", "fc.bias")
-        
+
     Returns:
         dict: mask dict with same structure as params_dict
     """
-    # Get the target parameter
-    if target_layer_name not in params_dict:
-        raise ValueError(f"Parameter '{target_layer_name}' not found in model")
-    
-    target_param = params_dict[target_layer_name]
-    
-    # Check if target is 2D or 1D
-    target_is_2d = len(target_param.shape) >= 2
-    
-    # Create template with all zeros
-    mask_dict = create_mask_template(params_dict)
-    
-    # Activate appropriate parameters
-    for key, value in params_dict.items():
-        if target_is_2d:
-            # If target is 2D, only activate that specific layer
-            if key == target_layer_name:
-                mask_dict[key] = torch.ones_like(value, dtype=torch.bool)
+    mask = {}
+    for key, val in params_dict.items():
+        if key in activate_params:
+            mask[key] = torch.ones_like(val, dtype=torch.bool)
         else:
-            # If target is 1D, activate ALL 1D parameters
-            if len(value.shape) < 2:  # 1D or 0D parameter
-                mask_dict[key] = torch.ones_like(value, dtype=torch.bool)
-    
-    return mask_dict
-
-
-def get_param_by_name(params_dict, name):
-    """
-    Get parameter tensor by dot-separated name.
-    
-    Args:
-        params_dict: nested dict of parameters
-        name: dot-separated parameter name (e.g., "layer1.weight")
-        
-    Returns:
-        torch.Tensor or None: the parameter if found, None otherwise
-    """
-    keys = name.split('.')
-    result = params_dict
-    try:
-        for key in keys:
-            # Try both string and integer keys
-            if key in result:
-                result = result[key]
-            elif key.isdigit() and int(key) in result:
-                result = result[int(key)]
-            else:
-                return None
-        return result
-    except (KeyError, TypeError):
-        return None
+            mask[key] = torch.zeros_like(val, dtype=torch.bool)
+    return mask
 
 
 def create_all_layer_masks(w, model_fn):
     """
     Create masks for all layers in the model.
-    
+
     Creates:
     - One mask for each 2D parameter (weight matrices, conv filters)
     - One mask for all 1D parameters (biases, norms) called "1d_params"
-    
+
     Args:
         w: flattened weight vector
         model_fn: functional model with unflatten method
-        
+
     Returns:
         dict: mapping from layer names to mask dicts
     """
     params_dict = model_fn.unflatten(w)
-    
-    # Identify all parameter names and their dimensions
-    param_names_2d = []
-    has_1d_params = False
-    
+
+    masks = {}
+    params_1d = []
+
     for key, value in params_dict.items():
         if len(value.shape) >= 2:
-            param_names_2d.append(key)
+            masks[key] = create_layers_mask([key], params_dict)
         else:
-            has_1d_params = True
-    
-    # Create masks
-    masks = {}
-    
-    # Create a mask for each 2D parameter
-    for layer_name in param_names_2d:
-        masks[layer_name] = create_layer_mask(params_dict, layer_name)
-    
+            params_1d.append(key)
+
     # Create one mask for all 1D parameters
-    if has_1d_params:
-        # Find first 1D param
-        first_1d = None
-        for key, value in params_dict.items():
-            if len(value.shape) < 2:
-                first_1d = key
-                break
-        
-        if first_1d:
-            masks["1d_params"] = create_layer_mask(params_dict, first_1d)
-    
+    if params_1d:
+        masks["1d_params"] = create_layers_mask(params_1d, params_dict)
+
     return masks
-
-
-def flatten_mask_dict(mask_dict):
-    """
-    Flatten a mask dict (flat dict of boolean tensors) into a 1D boolean tensor.
-    
-    Args:
-        mask_dict: flat dict of boolean tensors
-        
-    Returns:
-        torch.Tensor: 1D boolean tensor
-    """
-    flat_tensors = [mask.flatten() for mask in mask_dict.values()]
-    return torch.cat(flat_tensors)
 
 
 def print_layer_masks(masks, params_dict):
     """
     Print detailed information about each mask.
-    
+
     Args:
         masks: dict of mask dicts from create_all_layer_masks
         params_dict: flat dict of parameters
     """
     print("\n=== Layer Masks ===")
     print(f"Number of masks: {len(masks)}\n")
-    
+
     for mask_name, mask_dict in masks.items():
         print(f"\nMask: '{mask_name}'")
         print("-" * 80)
-        
+
         # Print all entries in this mask
         for key, mask_value in mask_dict.items():
             param = params_dict[key]
@@ -415,6 +323,8 @@ def print_layer_masks(masks, params_dict):
             shape_str = str(tuple(param.shape))
             dim_type = "2D+" if len(param.shape) >= 2 else "1D"
             is_active = "ACTIVE" if num_active > 0 else "inactive"
-            print(f"  {key:50s} | shape={shape_str:20s} | active={num_active:8,} [{dim_type}] | {is_active}")
-    
+            print(
+                f"  {key:50s} | shape={shape_str:20s} | active={num_active:8,} [{dim_type}] | {is_active}"
+            )
+
     print("\n" + "=" * 80 + "\n")
