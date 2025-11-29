@@ -45,6 +45,13 @@ class LossFunction:
         """
         return D(self.function, w, order, *vs)
 
+    def D_masked(self, w, mask, order=1, *vs) -> Array:
+        """Compute arbitrary higher-order derivatives with respect to masked subset of weights.
+
+        See documentation for D() in utils.py.
+        """
+        raise NotImplementedError
+
 
 class SupervisedLossFunction(LossFunction):
     """A loss function of the form E[l(f(x), y)].
@@ -97,7 +104,24 @@ class SupervisedLossFunction(LossFunction):
         def over_batch(batch): # D over a batch
           return D(lambda w_: self.batch_loss(w_, batch), w, order, *vs)
         return dataloop(over_batch, self.batches)
-        
+
+    def D_masked(self, w, mask, order=1, *vs) -> Array:
+        """Compute arbitrary higher-order derivatives with respect to masked subset of weights.
+
+        See documentation for D() in utils.py.
+        """
+        w_masked = w[mask]  # Extract only masked weights
+
+        def masked_loss(w_masked_, batch: Examples):
+            w_full = w.clone()
+            w_full[mask] = w_masked_
+            return self.batch_loss(w_full, batch)
+
+        def over_batch(batch):
+            return D(lambda w_: masked_loss(w_, batch), w_masked, order, *vs)
+
+        return dataloop(over_batch, self.batches)
+
 
 def dataloop(avg_over_batch: Callable[[Examples], Any], batches: Iterable[Examples]):
     """Given averages over batches, compute average over dataset.

@@ -15,7 +15,7 @@ Array = Any
 """Eigenvalue solvers."""
 
 
-def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_eigenvectors: Array = None,
+def compute_eigs(loss_fn: LossFunction, w: Array, mask: Array, neigs: int = None, warm_start_eigenvectors: Array = None,
                 P: Optional[Preconditioner] = None, return_sym_evecs: bool = False, solver: str = "lobpcg",
                 tol: float = 1e-10, chunk_size=-1) -> Tuple[Array, Array, Dict]:
     """Computes top eigenvectors/eigenvalues of the Hessian (or preconditioned Hessian).
@@ -50,7 +50,7 @@ def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_
     assert neigs is not None or warm_start_eigenvectors is not None
     
     if warm_start_eigenvectors is None:
-        warm_start_eigenvectors = _initialize_eigenvectors(len(w), neigs, w)
+        warm_start_eigenvectors = _initialize_eigenvectors(len(w[mask]), neigs, w)
     
     P_inv_sqrt = (lambda x: x) if P is None else P.pow(-1 / 2)
     
@@ -59,7 +59,7 @@ def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_
     def matvec(v):
         nonlocal matvec_count
         matvec_count += np.prod(v.shape[1:])        
-        _matvec = lambda v: P_inv_sqrt(loss_fn.D(w, 2, P_inv_sqrt(v)))
+        _matvec = lambda v: P_inv_sqrt(loss_fn.D_masked(w, mask, 2, P_inv_sqrt(v)))
         _matvec = torch.func.vmap(_matvec, 1, 1, chunk_size=chunk_size)
         return _matvec(v)
     
@@ -107,7 +107,7 @@ class WarmStartEigSolver:
     If you want to just track a fixed number of eigenvectors, then simply leave track_threshold as None.
     """
     
-    def __init__(self, loss_fn: LossFunction, w_example: Array,
+    def __init__(self, loss_fn: LossFunction, w_example: Array, mask: Array, 
                  initial_neigs: int = 1, return_sym_evecs=False, solver: str = "lobpcg",
                  tol: float = 1e-10, chunk_size: int = -1, track_threshold: float = None):
         """Initialize the eigenvalue solver.
@@ -130,12 +130,14 @@ class WarmStartEigSolver:
         self.n_eigs = initial_neigs
         self.chunk_size = chunk_size
         self.track_threshold = track_threshold
+        self.mask = mask
         
         if initial_neigs == 0:
             raise ValueError("initial_neigs must be > 0")
         
         # Eigenvectors that we keep around for warm-starting the eigenvalue solver.
         # These are eigenvectors of the 'symmetric' preconditioned Hessian P^{-1/2} H P^{-1/2}.
+        w_example = w_example[mask]
         self.symU = torch.randn((len(w_example), 0), dtype=w_example.dtype, device=w_example.device)
 
     def update(self, w: Array, P: Optional[Preconditioner] = None) -> Tuple[Array, Array, Dict]:
@@ -161,7 +163,7 @@ class WarmStartEigSolver:
 
             # compute the new eigenvalues and eigenvectors
             eigs, symU, log = compute_eigs(
-                self.loss_fn, w, P=P, return_sym_evecs=self.return_sym_evecs, warm_start_eigenvectors=self.symU,
+                self.loss_fn, w, self.mask, P=P, return_sym_evecs=self.return_sym_evecs, warm_start_eigenvectors=self.symU,
                 solver=self.solver, tol=self.tol, chunk_size=self.chunk_size)
 
             # break if we aren't enforcing a track threshold

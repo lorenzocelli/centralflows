@@ -225,8 +225,7 @@ class RawEigLogger(ProcessLogger):
             else: # otherwise, use the processes's raw_eig_manager to solve for the raw eigs
                 if group.raw_eig_manager is not None:
                     group.raw_eig_manager.solver.n_eigs = group.eig_manager.solver.n_eigs
-                    # TODO: this should probably be delegated to the process/group since it requires masking
-                    raw_eigs = group.raw_eig_manager.get(process.w[group.mask])[0]
+                    raw_eigs = group.raw_eig_manager.get(process.w)[0]
                     output[k] = dict(hessian_eigs=raw_eigs)
                 else:
                     output[k] = dict()

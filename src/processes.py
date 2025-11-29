@@ -45,13 +45,12 @@ class WeightGroup:
         w_example: Array,
         eig_config: EigConfig,
     ):
-        w_example = w_example[self.mask]
-
         # eigenvalue manager for the effective Hessian
         self.eig_manager = EigManager(
-            loss_fn=loss_function, 
+            loss_fn=loss_function,
             w_example=w_example,
-            config=eig_config
+            mask=self.mask,
+            config=eig_config,
         )
 
         # if the optimizer admits no trivial way of computing the "raw" Hessian eigenvalues
@@ -60,6 +59,7 @@ class WeightGroup:
             self.raw_eig_manager = EigManager(
                 loss_fn=loss_function, 
                 w_example=w_example,
+                mask=self.mask,
                 config=replace(eig_config, track_threshold=None)
             )
 
@@ -69,7 +69,7 @@ class WeightGroup:
 
         timer = Timer()
         with timer("eig"):
-            self.eff_eigs, _, eig_logs = self.eig_manager.get(w[self.mask], P=P)
+            self.eff_eigs, _, eig_logs = self.eig_manager.get(w, P=P)
 
         return dict(times=timer.times, eig_logs=eig_logs)
 
@@ -547,7 +547,7 @@ class EigManager:
     uᵢᵀH uᵢ where {uᵢ} are the most recently computed top eigenvectors.
     """
     
-    def __init__(self, loss_fn: LossFunction, w_example: Array, config: EigConfig):
+    def __init__(self, loss_fn: LossFunction, w_example: Array, mask: Array, config: EigConfig):
         self.loss_fn = loss_fn
         self.config = config
         
@@ -560,7 +560,7 @@ class EigManager:
         self.cache = dict(symU=None, eigs=None, counter=None)
         
         self.solver = WarmStartEigSolver(
-            loss_fn=loss_fn, w_example=w_example,
+            loss_fn=loss_fn, w_example=w_example, mask=mask,
             initial_neigs=config.initial_neigs, return_sym_evecs=True,
             solver=config.solver, tol=config.tol,
             chunk_size=config.chunk_size, track_threshold=config.track_threshold
