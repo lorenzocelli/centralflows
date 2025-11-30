@@ -32,7 +32,7 @@ from src.processes import (
 )
 from src.saving import Checkpointer, DataSaver, LoadOptions
 from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp, Muon
-from src.utils import convert_dataclasses, create_all_layer_masks, print_layer_masks, flatten_pytree
+from src.utils import convert_dataclasses, create_all_layer_masks, create_layers_mask, print_layer_masks, flatten_pytree
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 torch.backends.cudnn.allow_tf32 = False
@@ -101,7 +101,7 @@ def main(
     
     # make the model functional. 'model_fn' is a functional version of the network; 'w' are the initial weights
     w, model_fn = FunctionalModel.make_functional(model)
-
+    
     print("\n=== Parameter Structure ===")
     params_dict = model_fn.unflatten(w)
 
@@ -124,23 +124,39 @@ def main(
     # TODO: allow configuring the optimizer from command line
     groups = {}
 
-    for mask_name, mask_dict in masks.items():
-        flat_mask, _ = flatten_pytree(mask_dict)
+    # 1. Identify 2D Params and their shapes for Muon
+    muon_mask = torch.zeros_like(w, dtype=torch.bool)
+    shapes_2d = []
 
-        # Verify the flattened mask has the same shape as w
-        assert flat_mask.shape == w.shape, f"Mask {mask_name} shape {flat_mask.shape} != w shape {w.shape}"
+    # Iterate in order of keys to ensure deterministic flattened order
+    for key, param in params_dict.items():
+        if param.ndim >= 2 and "embed" not in key:  # Muon Criteria
+            # Get mask for this param
+            param_mask_dict = create_layers_mask([key], params_dict)
+            flat_m, _ = flatten_pytree(param_mask_dict)
+            muon_mask |= flat_m
+            shapes_2d.append(param.shape)
 
-        if mask_name == "1d_params":
-            # Use GradientDescent for 1D parameters (biases, norms, etc.)
-            opt = GradientDescent(lr=1e-2)
-            state = opt.initialize_state(w)
-            groups[mask_name] = WeightGroup(opt=opt, state=state, mask=flat_mask)
-        else:
-            # Use Muon for 2D parameters (weight matrices)
-            opt = Muon(lr=0.02)  # Usa i parametri appropriati per Muon
-            state = opt.initialize_state(w)
-            groups[mask_name] = WeightGroup(opt=opt, state=state, mask=flat_mask)
-    
+    # 2. Create Groups
+
+    # Muon Group
+    if shapes_2d:
+        # We must initialize state ONLY on the masked weights
+        w_muon = w[muon_mask]
+
+        opt_muon = Muon(lr=0.02, shapes=shapes_2d)
+        state_muon = opt_muon.initialize_state(w_muon)  # Pass subset w
+
+        groups["muon"] = WeightGroup(opt=opt_muon, state=state_muon, mask=muon_mask)
+
+    # Non-Muon Group (SGD for 1D params)
+    non_muon_mask = ~muon_mask
+    if non_muon_mask.any():
+        w_other = w[non_muon_mask]
+        opt_other = GradientDescent(lr=0.01)
+        state_other = opt_other.initialize_state(w_other)
+        groups["other"] = WeightGroup(opt=opt_other, state=state_other, mask=non_muon_mask)
+
     print(f"\n=== Created {len(groups)} Weight Groups ===")
     for name, group in groups.items():
         num_params = group.mask.sum().item()

@@ -309,37 +309,133 @@ class RMSProp(UpdateRule):
             "lr": self.lr_fn(state["t"]), # current learning rate
         }
 
-@dataclass # we make it a dataclass so that it can be instantiated from the command line
+@dataclass
 class Muon(UpdateRule):
-    """A placeholder for the Muon optimizer."""
-
-    # ! TODO IMPLEMENT MUON OPTIMIZER
-    
-    lr: float  # the learning rate
+    lr: float
+    momentum: float = 0.95
+    ns_steps: int = 5
+    # We need to pass shapes to know how to reconstruct matrices
+    shapes: list[torch.Size] = None
 
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
     def initialize_state(self, w: Array) -> Array:
-        state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
+        # State is just momentum, same shape as w
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+            "momentum": torch.zeros_like(w)
+        }
         flat_state, self.unflatten = flatten_pytree(state)
         return flat_state
 
-    def P(self, flat_state: Array) -> Array:
-        state = self.unflatten(flat_state)
-        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]))
-
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
-        state = {"t": state["t"] + 1.0}
+        t = state["t"]
+        mom = state["momentum"]
+
+        # Update momentum in-place (standard SGD momentum)
+        mom.lerp_(gradient, 1 - self.momentum)
+
+        state = {"t": t + 1.0, "momentum": mom}
         return flatten_pytree(state)[0]
 
-    def summarize_state(self, flat_state: Array) -> Array:
+    def P(self, flat_state: Array) -> Preconditioner:
+        """
+        Constructs the Preconditioner for Analysis.
+        Uses SVD to allow calculating P^{-1/2}.
+        """
         state = self.unflatten(flat_state)
-        return {
-            "t": state["t"],
-            "lr": self.lr_fn(state["t"]),
-        }
+        momentum_flat = state["momentum"]
+
+        # We need to unflatten the momentum to process block-by-block
+        blocks = self._unflatten_vector(momentum_flat)
+
+        svd_factors = []
+        for block in blocks:
+            # Reshape Conv2d (Out, In, H, W) -> (Out, In*H*W)
+            if block.ndim > 2:
+                block = block.view(block.size(0), -1)
+
+            # SVD for (MM^T)^{1/2}
+            # If Tall (Rows > Cols), we transpose to run SVD on smaller dim
+            transposed = False
+            if block.size(0) > block.size(1):
+                block = block.mT
+                transposed = True
+
+            try:
+                # Use float32 for stability
+                U, S, _ = torch.linalg.svd(block.float(), full_matrices=False)
+                U, S = U.to(block.dtype), S.to(block.dtype)
+            except:
+                # Fallback
+                U = torch.eye(block.size(0), device=block.device, dtype=block.dtype)
+                S = torch.ones(block.size(0), device=block.device, dtype=block.dtype)
+
+            svd_factors.append((U, S, transposed, block.shape))
+
+        return MuonPreconditioner(svd_factors, self.lr_fn(state["t"]), self.shapes)
+
+    def step(self, w: Array, flat_state: Array, gradient: Array) -> Array:
+        """
+        Performs the Muon Step using Newton-Schulz.
+        """
+        state = self.unflatten(flat_state)
+        momentum_flat = state["momentum"]
+
+        # 1. Unflatten momentum
+        mom_blocks = self._unflatten_vector(momentum_flat)
+        updates = []
+
+        # 2. Apply Newton-Schulz to each block
+        for mom in mom_blocks:
+            updates.append(self._newton_schulz_update(mom))
+
+        # 3. Flatten back
+        update_flat = torch.cat([u.flatten() for u in updates])
+
+        # 4. Apply update
+        lr = self.lr_fn(state["t"])
+        return w - lr * update_flat
+
+    def _unflatten_vector(self, flat_vec):
+        """Helper to break flat vector into blocks based on self.shapes"""
+        blocks = []
+        curr = 0
+        for shape in self.shapes:
+            numel = shape.numel()
+            blocks.append(flat_vec[curr : curr + numel].view(shape))
+            curr += numel
+        return blocks
+
+    def _newton_schulz_update(self, G):
+        """Original Muon Newton-Schulz implementation"""
+        # Handle shapes (Conv2d -> 2D)
+        original_shape = G.shape
+        if G.ndim > 2:
+             G = G.view(G.size(0), -1)
+
+        X = G.bfloat16()
+        if X.size(0) > X.size(1): X = X.mT
+
+        # NS Loop
+        X = X / (X.norm() + 1e-7)
+        for _ in range(self.ns_steps):
+            A = X @ X.mT
+            B = -4.7750 * A + 2.0315 * A @ A # Simplification of coeffs
+            X = 3.4445 * X + B @ X
+
+        if G.size(0) > G.size(1): X = X.mT
+
+        # Scale factor
+        scale = max(1, G.size(0)/G.size(1))**0.5
+        update = X.to(G.dtype) * scale
+
+        return update.view(original_shape)
+
+    def summarize_state(self, flat_state):
+        return {"lr": self.lr_fn(self.unflatten(flat_state)["t"])}
 
 class Preconditioner:
     """Abstract class for a preconditioner."""
@@ -369,10 +465,10 @@ class Preconditioner:
 
 class DiagonalPreconditioner(Preconditioner):
     """A diagonal (i.e. elementwise) preconditioner."""
-    
+
     def __init__(self, P):
         """Constructor for the diagonal preconditioner.
-        
+
         Args:
           P (Array): the diagonal preconditioner, as a vector
         """
@@ -383,6 +479,57 @@ class DiagonalPreconditioner(Preconditioner):
 
     def pow(self, power: float) -> DiagonalPreconditioner:
         return DiagonalPreconditioner(self.P**power)
+
+
+class MuonPreconditioner(Preconditioner):
+    """Block-diagonal preconditioner for Muon optimizer using SVD factors."""
+
+    def __init__(self, factors, lr, shapes):
+        """Constructor for the Muon preconditioner.
+
+        Args:
+            factors: List of (U, S, transposed, shape) tuples from SVD
+            lr: Learning rate
+            shapes: List of original parameter shapes
+        """
+        self.factors = factors
+        self.lr = lr
+        self.shapes = shapes
+
+    def __call__(self, v):
+        # Applies P * v
+        # P = (1/lr) * (MM^T)^{1/2}
+        curr = 0
+
+        # Unflatten v
+        v_blocks = []
+        for shape in self.shapes:
+            numel = shape.numel()
+            v_blocks.append(v[curr : curr+numel].view(shape))
+            curr += numel
+
+        # Apply blocks
+        out_blocks = []
+        for v_blk, (U, S, transposed, _) in zip(v_blocks, self.factors):
+            target = v_blk
+            if target.ndim > 2: target = target.view(target.size(0), -1)
+
+            if transposed: target = target.mT
+
+            # Apply (MM^T)^{1/2} via SVD factors: U * S * U.T
+            res = U @ (S.unsqueeze(-1) * (U.mT @ target))
+
+            if transposed: res = res.mT
+            out_blocks.append(res.view(v_blk.shape).flatten())
+
+        return torch.cat(out_blocks) * (1.0 / self.lr)
+
+    def pow(self, p):
+        # P^p = (1/lr)^p * (MM^T)^{p/2}
+        new_factors = []
+        for (U, S, tr, sh) in self.factors:
+            new_factors.append((U, S.pow(p), tr, sh))
+        return MuonPreconditioner(new_factors, self.lr**p, self.shapes)
 
 
 def to_schedule(schedule_or_constant):
