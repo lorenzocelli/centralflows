@@ -124,33 +124,32 @@ def main(
     # TODO: allow configuring the optimizer from command line
     groups = {}
 
-    # 1. Identify 2D Params and their shapes for Muon
-    muon_mask = torch.zeros_like(w, dtype=torch.bool)
-    shapes_2d = []
+    # Track which parameters have been assigned to a group
+    assigned_mask = torch.zeros_like(w, dtype=torch.bool)
 
-    # Iterate in order of keys to ensure deterministic flattened order
+    # Create a separate Muon group for each layer with 2D parameters
     for key, param in params_dict.items():
         if param.ndim >= 2 and "embed" not in key:  # Muon Criteria
-            # Get mask for this param
+            # Get mask for this specific layer's parameter
             param_mask_dict = create_layers_mask([key], params_dict)
-            flat_m, _ = flatten_pytree(param_mask_dict)
-            muon_mask |= flat_m
-            shapes_2d.append(param.shape)
+            layer_mask, _ = flatten_pytree(param_mask_dict)
 
-    # 2. Create Groups
+            # Extract weights for this layer
+            w_layer = w[layer_mask]
 
-    # Muon Group
-    if shapes_2d:
-        # We must initialize state ONLY on the masked weights
-        w_muon = w[muon_mask]
+            # Create a Muon optimizer for this single layer
+            opt_layer = Muon(lr=0.02, shapes=[param.shape])
+            state_layer = opt_layer.initialize_state(w_layer)
 
-        opt_muon = Muon(lr=0.02, shapes=shapes_2d)
-        state_muon = opt_muon.initialize_state(w_muon)  # Pass subset w
+            # Add to groups with layer-specific name
+            group_name = f"muon_{key}"
+            groups[group_name] = WeightGroup(opt=opt_layer, state=state_layer, mask=layer_mask)
 
-        groups["muon"] = WeightGroup(opt=opt_muon, state=state_muon, mask=muon_mask)
+            # Mark these parameters as assigned
+            assigned_mask |= layer_mask
 
-    # Non-Muon Group (SGD for 1D params)
-    non_muon_mask = ~muon_mask
+    # Non-Muon Group (SGD for 1D params and any unassigned params)
+    non_muon_mask = ~assigned_mask
     if non_muon_mask.any():
         w_other = w[non_muon_mask]
         opt_other = GradientDescent(lr=0.01)

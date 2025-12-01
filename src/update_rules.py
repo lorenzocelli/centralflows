@@ -341,38 +341,41 @@ class Muon(UpdateRule):
         return flatten_pytree(state)[0]
 
     def P(self, flat_state: Array) -> Preconditioner:
-        """
-        Constructs the Preconditioner for Analysis.
-        Uses SVD to allow calculating P^{-1/2}.
-        """
         state = self.unflatten(flat_state)
         momentum_flat = state["momentum"]
-
-        # We need to unflatten the momentum to process block-by-block
+        
         blocks = self._unflatten_vector(momentum_flat)
-
+        
         svd_factors = []
         for block in blocks:
-            # Reshape Conv2d (Out, In, H, W) -> (Out, In*H*W)
             if block.ndim > 2:
                 block = block.view(block.size(0), -1)
+            
+            # === FIX 1: Normalize Momentum Scale ===
+            # Muon is scale-invariant. We must normalize the block 
+            # so P reflects the geometry of the DIRECTION, not the magnitude.
+            # This matches the Newton-Schulz logic: X / (X.norm() + 1e-7)
+            block_norm = block.norm() + 1e-7
+            block_normalized = block / block_norm
 
-            # SVD for (MM^T)^{1/2}
-            # If Tall (Rows > Cols), we transpose to run SVD on smaller dim
             transposed = False
-            if block.size(0) > block.size(1):
-                block = block.mT
+            if block_normalized.size(0) > block_normalized.size(1):
+                block_normalized = block_normalized.mT
                 transposed = True
-
+                
             try:
-                # Use float32 for stability
-                U, S, _ = torch.linalg.svd(block.float(), full_matrices=False)
+                # Run SVD on the NORMALIZED block
+                U, S, _ = torch.linalg.svd(block_normalized.float(), full_matrices=False)
                 U, S = U.to(block.dtype), S.to(block.dtype)
+                
+                # === FIX 2: Regularize Singular Values ===
+                # Prevent division by zero in analysis if S has zeros (common in low-rank)
+                S = S + 1e-6 
+                
             except:
-                # Fallback
                 U = torch.eye(block.size(0), device=block.device, dtype=block.dtype)
                 S = torch.ones(block.size(0), device=block.device, dtype=block.dtype)
-
+                
             svd_factors.append((U, S, transposed, block.shape))
 
         return MuonPreconditioner(svd_factors, self.lr_fn(state["t"]), self.shapes)
