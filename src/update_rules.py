@@ -26,7 +26,7 @@ class UpdateRule:
     The functional design here is inspired by Jax's Optax library.
     """
         
-    def initialize_state(self, w: torch.Tensor) -> Array:
+    def initialize_state(self, w: torch.Tensor, unflatten: Any = None) -> Array:
         """Initialize the state.
         
         Args:
@@ -105,7 +105,7 @@ class GradientDescent(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
         state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
         flat_state, self.unflatten = flatten_pytree(state)
         return flat_state
@@ -169,7 +169,7 @@ class ScalarRMSProp(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "nu": torch.tensor(0.0, dtype=w.dtype, device=w.device),
@@ -251,7 +251,7 @@ class RMSProp(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "nu": torch.zeros_like(w),
@@ -295,6 +295,110 @@ class RMSProp(UpdateRule):
             "lr": self.lr_fn(state["t"]), # current learning rate
         }
 
+@dataclass
+class Muon(UpdateRule):
+    """
+    The Muon optimizer.
+
+    This class is the entire Muon optimizer, hence it should deal with ALL PARAMETERS together,
+    and internally should handle the difference between 2D (layers) and 1D (biases) parameters.
+
+    In particular, 1D parameters should be assigned an AdamW-like update rule, while 2D parameters should
+    compute the Muon preconditioner.
+
+    Hence, the state should contain both the AdamW state for the 1D parameters, as well as the Muon state for the 2D parameters.
+    """
+
+    # ^ Generic parameters
+    lr: float
+
+    # ^ Muon parameters
+    momentum: float = 0.95
+    nesterov: bool = True
+
+    # ^ AdamW parameters
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.01
+
+    def __post_init__(self):
+        self.lr_fn = to_schedule(self.lr)
+        self.unflatten_fn = None
+
+    def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
+        """
+        This function should initialize the state (t [scalar], momentum [for all parameters, shape of w], 
+                        variance [for 1D parameters only, shape of w, with 0s for 2D parameters])
+
+        The unflatten function is required to obtain the dictionary of the parameters
+        
+        Args:
+            w: the initial weights
+            unflatten: function to unflatten the weights into a pytree (dict of tensors) [optional]
+        """
+        if unflatten is None:
+            raise ValueError("unflatten function must be provided to initialize Muon optimizer state.")
+        self.unflatten_fn = unflatten
+
+        # === DEBUG BLOCK START ===
+        print("\n[Muon Debug] Checking parameter structure via unflatten:")
+        try:
+            params_dict = self.unflatten_fn(w)
+            count_2d = 0
+            count_1d = 0
+            
+            for name, param in params_dict.items():
+                ndim = param.ndim
+                shape = tuple(param.shape)
+                param_type = "MUON (2D+)" if ndim >= 2 else "ADAMW (1D)"
+                
+                if ndim >= 2:
+                    count_2d += 1
+                else:
+                    count_1d += 1
+                    
+                print(f"  - {name:30s} | Shape: {str(shape):15s} | Dim: {ndim} -> {param_type}")
+            
+            print(f"\n[Muon Debug] Summary: Found {count_2d} matrices (Muon) and {count_1d} vectors (AdamW).")
+            print("[Muon Debug] Unflatten works correctly!\n")
+            
+        except Exception as e:
+            print(f"\n[Muon Debug] ERROR: unflatten failed! Exception: {e}")
+            raise e
+        # === DEBUG BLOCK END ===
+
+        # TODO create the state dictionary, flatten it with flatten_pytree and return the flat state
+        # * Remember to store the unflatten function (different from the unflatten_fn) for later use
+        # * self.unflatten -> function to unflatten the optimizer state
+        # * self.unflatten_fn -> function to unflatten the model parameters
+
+        raise NotImplementedError()
+
+    def P(self, flat_state: Array) -> Array:
+        """This function should do a distinction between 1D and 2D parameters,
+        and build the block-diagonal preconditioner accordingly. For the 1D parameters, 
+        should use AdamW preconditioner, while for the 2D parameters should compute the Muon preconditioner.
+        """
+        raise NotImplementedError()
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        """This function should update the state accordingly:
+        - for t, increment by 1
+        - for momentum, update for ALL parameters
+        - for variance, update only for 1D parameters
+        """
+        raise NotImplementedError()
+
+    def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
+        """
+        Perform the full optimization step.
+        
+        OVERRIDE REQUIRED: We cannot rely on the base class implementation (w - P_inv * g) because
+        Muon and AdamW apply updates to the Momentum, not the raw Gradient, and Muon uses a non-linear
+        orthogonalization step.
+        """
+        raise NotImplementedError()
 
 class Preconditioner:
     """Abstract class for a preconditioner."""
