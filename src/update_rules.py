@@ -341,46 +341,128 @@ class Muon(UpdateRule):
             raise ValueError("unflatten function must be provided to initialize Muon optimizer state.")
         self.unflatten_fn = unflatten
 
-        # === DEBUG BLOCK START ===
-        print("\n[Muon Debug] Checking parameter structure via unflatten:")
-        try:
-            params_dict = self.unflatten_fn(w)
-            count_2d = 0
-            count_1d = 0
-            
-            for name, param in params_dict.items():
-                ndim = param.ndim
-                shape = tuple(param.shape)
-                param_type = "MUON (2D+)" if ndim >= 2 else "ADAMW (1D)"
-                
-                if ndim >= 2:
-                    count_2d += 1
-                else:
-                    count_1d += 1
-                    
-                print(f"  - {name:30s} | Shape: {str(shape):15s} | Dim: {ndim} -> {param_type}")
-            
-            print(f"\n[Muon Debug] Summary: Found {count_2d} matrices (Muon) and {count_1d} vectors (AdamW).")
-            print("[Muon Debug] Unflatten works correctly!\n")
-            
-        except Exception as e:
-            print(f"\n[Muon Debug] ERROR: unflatten failed! Exception: {e}")
-            raise e
-        # === DEBUG BLOCK END ===
+        params = self.unflatten_fn(w)
 
-        # TODO create the state dictionary, flatten it with flatten_pytree and return the flat state
+        self.param_blocks = []
+        cursor = 0
+
+        for name, p in params.items():
+            numel = p.numel()
+            start = cursor
+            end = cursor + numel
+
+            block_type = "muon" if p.ndim >= 2 else "adam"
+
+            self.param_blocks.append({
+                "name": name,
+                "type": block_type,
+                "idx": (start, end),
+                "shape": tuple(p.shape),
+                "ndim": p.ndim,
+            })
+
+            cursor = end
+
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+            "momentum": torch.zeros_like(w),         #!  used for ALL parameters
+            "exp_avg": torch.zeros_like(w),          #!  used only for AdamW blocks
+            "exp_avg_sq": torch.zeros_like(w),       #!  used only for AdamW blocks
+        }
+
+        # ------------------------- DEBUG BLOCK -------------------------
+        print("\n[Muon Initialize] Parameter Block Summary:")
+        count_muon = 0
+        count_adam = 0
+
+        for b in self.param_blocks:
+            name = b["name"]
+            btype = b["type"]
+            s, e = b["idx"]
+            shape = b["shape"]
+
+            if btype == "muon":
+                count_muon += 1
+            else:
+                count_adam += 1
+
+            print(f"  - {name:25s} | {btype.upper():5s} | idx=({s},{e}) | shape={shape}")
+
+        print(f"\n[Muon Initialize] TOTAL blocks: {len(self.param_blocks)}")
+        print(f"   - Muon (2D+) blocks : {count_muon}")
+        print(f"   - AdamW (1D) blocks : {count_adam}")
+        print(f"   - Total parameters  : {w.numel()} entries")
+        print("[Muon Initialize] Flat state created with fields: t, momentum, exp_avg, exp_avg_sq\n")
+        # ---------------------------------------------------------------
+
         # * Remember to store the unflatten function (different from the unflatten_fn) for later use
         # * self.unflatten -> function to unflatten the optimizer state
         # * self.unflatten_fn -> function to unflatten the model parameters
+        flat_state, self.unflatten = flatten_pytree(state)
 
-        raise NotImplementedError()
+        # ------------------------- TEST BLOCK -------------------------
+        print("\n[Muon Test] Testing P construction...")
+        test_P = self.P(flat_state)
+        
+        # Test 1: Size consistency
+        assert test_P.total_size == w.numel(), f"P size mismatch: {test_P.total_size} vs {w.numel()}"
+        print(f"[Muon Test] ✓ P.total_size matches w.numel() = {w.numel()}")
+        
+        # Test 2: Forward pass (P @ ones)
+        test_vec = torch.ones_like(w)
+        result = test_P(test_vec)
+        assert result.shape == w.shape, f"P(v) shape mismatch: {result.shape} vs {w.shape}"
+        print(f"[Muon Test] ✓ P(ones) has correct shape")
+        
+        # Test 3: Inverse (P^-1 @ ones)
+        P_inv = test_P.pow(-1)
+        result_inv = P_inv(test_vec)
+        print(f"[Muon Test] ✓ P^-1(ones) computed successfully")
+        print(f"[Muon Test]   P^-1(ones) stats: mean={result_inv.mean():.6f}, std={result_inv.std():.6f}")
+        
+        print("[Muon Test] All tests passed!\n")
+        # --------------------------------------------------------------
+        return flat_state
 
     def P(self, flat_state: Array) -> Array:
         """This function should do a distinction between 1D and 2D parameters,
         and build the block-diagonal preconditioner accordingly. For the 1D parameters, 
         should use AdamW preconditioner, while for the 2D parameters should compute the Muon preconditioner.
         """
-        raise NotImplementedError()
+        state = self.unflatten(flat_state)
+        t = state["t"]
+        exp_avg_sq = state["exp_avg_sq"] # should be the variance buffer
+
+        lr = self.lr_fn(t)
+
+        P_diag_blocks = []
+        for block in self.param_blocks:
+            block_type = block["type"]
+            start_idx, end_idx = block["idx"]
+            block_size = end_idx - start_idx
+
+            if block_type == "muon":
+                # TODO implement muon case
+                # This is not the final implementation, just a placeholder
+                P_diag_blocks.append({
+                    "type": "identity",
+                    "size": block_size,
+                    "data": None,
+                    "name": block["name"],
+                    "scale": 1.0 / lr
+                })
+            elif block_type == "adam":
+                # * Extract the v for this specific block
+                v_block = exp_avg_sq[start_idx:end_idx]
+                P_block = (torch.sqrt(v_block) + self.adam_eps) / lr
+
+                P_diag_blocks.append({
+                    "type": "diagonal",
+                    "size": block_size,
+                    "data": P_block,
+                    "name": block["name"]
+                })
+        return BlockDiagonalPreconditioner(P_diag_blocks)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         """This function should update the state accordingly:
@@ -442,6 +524,98 @@ class DiagonalPreconditioner(Preconditioner):
 
     def pow(self, power: float) -> DiagonalPreconditioner:
         return DiagonalPreconditioner(self.P**power)
+
+
+class BlockDiagonalPreconditioner(Preconditioner):
+    """A block-diagonal preconditioner.
+
+    The preconditioner is represented as a list of blocks, where each block
+    can be either an Identity matrix (for Muon) or a Diagonal matrix (for AdamW).
+    """
+    # TODO CHANGE DESCRIPTION, FOR NOW IT'S OK BUT MUON IS NOT IDENTITY IN FINAL VERSION
+
+    def __init__(self, blocks: list[dict]):
+        """Constructor for the block-diagonal preconditioner.
+        
+        Args:
+            blocks: List of dicts, each containing:
+                - "type": "identity" or "diagonal"
+                - "size": number of parameters in this block
+                - "data": None (for identity) or torch.Tensor (for diagonal)
+                - "name": parameter name (for debugging)
+        """
+        self.blocks = blocks
+        
+        # Precompute total size for validation
+        self.total_size = sum(b["size"] for b in blocks)
+        
+        # === DEBUG INFO ===
+        print("\n[BlockDiagonalPreconditioner] Created with structure:")
+        for i, b in enumerate(blocks):
+            btype = b["type"]
+            size = b["size"]
+            name = b["name"]
+            if btype == "identity":
+                print(f"  Block {i:2d}: {name:25s} | IDENTITY   | size={size:6d}")
+            else:
+                print(f"  Block {i:2d}: {name:25s} | DIAGONAL   | size={size:6d} | mean={b['data'].mean().item():.6f}")
+        print(f"[BlockDiagonalPreconditioner] Total size: {self.total_size}\n")
+    
+    def __call__(self, v: Array) -> Array:
+        """Apply the preconditioner: compute P @ v.
+        
+        Args:
+            v: vector of size (total_size,)
+        
+        Returns:
+            P @ v
+        """
+        if v.numel() != self.total_size:
+            raise ValueError(f"Input vector size {v.numel()} doesn't match preconditioner size {self.total_size}")
+        
+        result_blocks = []
+        cursor = 0
+        
+        for block in self.blocks:
+            size = block["size"]
+            v_block = v[cursor:cursor+size]
+            
+            if block["type"] == "identity":
+                # Identity: P @ v = v
+                result_blocks.append(v_block)
+            else:  # diagonal
+                # Diagonal: P @ v = diag * v (element-wise)
+                result_blocks.append(block["data"] * v_block)
+            
+            cursor += size
+        
+        return torch.cat(result_blocks, dim=0)
+    
+    def pow(self, power: float) -> BlockDiagonalPreconditioner:
+        """Return P^power (each block raised to the power).
+        
+        Args:
+            power: the exponent
+        
+        Returns:
+            A new BlockDiagonalPreconditioner with each block raised to the power.
+        """
+        new_blocks = []
+        
+        for block in self.blocks:
+            new_block = block.copy()
+            
+            if block["type"] == "identity":
+                # Identity^p = Identity
+                new_block["data"] = None
+            else:  # diagonal
+                # (Diagonal)^p = element-wise power
+                new_block["data"] = block["data"] ** power
+            
+            new_blocks.append(new_block)
+        
+        return BlockDiagonalPreconditioner(new_blocks)
+
 
 
 def to_schedule(schedule_or_constant):
