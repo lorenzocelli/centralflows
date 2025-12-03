@@ -139,10 +139,14 @@ class DiscreteProcess(Process):
     def prepare(self):
         timer = Timer()
         with timer("grad_and_value"):
+            print("[DEBUG] Computing grad and value", flush=True)
             self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)
+            print("[DEBUG] Updating state", flush=True)
             self.state = self.opt.update_state(self.state, self.gradient)
+            print("[DEBUG] Computing P", flush=True)
             P = self.opt.P(self.state)
         with timer("eig"):
+            print(f"[DEBUG] Computing eigenvalues with P", flush=True)
             self.eff_eigs, _, eig_logs = self.eig_manager.get(self.w, P=P)
         return dict(times=timer.times, eig_logs=eig_logs)
 

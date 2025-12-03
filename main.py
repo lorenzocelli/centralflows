@@ -162,16 +162,19 @@ def main(
 
     # main training loop - run all processes in parallel
     print(
-        f"Running concurrent processes from step {initial_step} to {initial_step + steps}"
+        f"Running concurrent processes from step {initial_step} to {initial_step + steps}",
+        flush=True
     )
     with DataSaver(
         folder / "data.hdf5", initial_step=initial_step, total_steps=steps
     ) as data_saver:
+        print("Entering main loop", flush=True)
         for i in trange(steps):
             # TODO: this currently is not used anywhere
             # step = initial_step + i
                         
             # save checkpoint if appropriate
+            print("[DEBUG] Checking checkpoint", flush=True)
             checkpointer.maybe_checkpoint(i, processes)
             
             # collected data will go here
@@ -179,7 +182,9 @@ def main(
             
             # for each process: prepare for the step
             for name in processes:
+                print(f"[DEBUG] Preparing process {name}", flush=True)
                 process_log = processes[name].prepare()
+                print(f"[DEBUG] Prepared process {name}", flush=True)
                 out[name].update(process_log)
             
             # run group loggers
@@ -193,9 +198,11 @@ def main(
                                         
             # for each process: take the step
             for name in processes:
+                print(f"[DEBUG] Stepping process {name}", flush=True)
                 processes[name].step()
                 
             # save data to disk
+            print(f"[DEBUG] Saving data for step {i}", flush=True)
             data_saver.save(i, out)
 
 

@@ -365,8 +365,7 @@ class Muon(UpdateRule):
 
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
-            "momentum": torch.zeros_like(w),         #!  used for ALL parameters
-            "exp_avg": torch.zeros_like(w),          #!  used only for AdamW blocks
+            "exp_avg": torch.zeros_like(w),          #!  used by BOTH Muon and AdamW blocks
             "exp_avg_sq": torch.zeros_like(w),       #!  used only for AdamW blocks
         }
 
@@ -432,11 +431,14 @@ class Muon(UpdateRule):
         state = self.unflatten(flat_state)
         t = state["t"]
         exp_avg_sq = state["exp_avg_sq"] # should be the variance buffer
+        print(f"[DEBUG P] t={t.item()}, exp_avg_sq shape={exp_avg_sq.shape}", flush=True)
 
         lr = self.lr_fn(t)
 
         P_diag_blocks = []
-        for block in self.param_blocks:
+        print(f"[DEBUG P] Processing {len(self.param_blocks)} blocks", flush=True)
+        for i, block in enumerate(self.param_blocks):
+            print(f"[DEBUG P] Processing block {i}/{len(self.param_blocks)}: {block['name']} ({block['type']})", flush=True)
             block_type = block["type"]
             start_idx, end_idx = block["idx"]
             block_size = end_idx - start_idx
@@ -462,6 +464,7 @@ class Muon(UpdateRule):
                     "data": P_block,
                     "name": block["name"]
                 })
+        print("[DEBUG P] Finished processing blocks, constructing BlockDiagonalPreconditioner", flush=True)
         return BlockDiagonalPreconditioner(P_diag_blocks)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
@@ -470,7 +473,86 @@ class Muon(UpdateRule):
         - for momentum, update for ALL parameters
         - for variance, update only for 1D parameters
         """
-        raise NotImplementedError()
+        # * Get the current state
+        state = self.unflatten(flat_state)
+        t = state["t"]
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+
+        t_new = t + 1.0
+        exp_avg_new = exp_avg.clone()
+        exp_avg_sq_new = exp_avg_sq.clone()
+
+        debug_info = {
+            "muon_blocks": {"count": 0, "grad_norm": 0.0, "exp_avg_norm": 0.0},
+            "adam_blocks": {"count": 0, "grad_norm": 0.0, "exp_avg_norm": 0.0, "exp_avg_sq_mean": 0.0}
+        }
+
+        for block in self.param_blocks:
+            start, end = block["idx"]
+            g_block = gradient[start:end] #! This is the gradient for the current block of parameters
+
+            if block["type"] == "muon":
+                # ^ Muon Update (TODO IMPLEMENT)
+                m_block = exp_avg[start:end]
+                m_new = self.momentum * m_block + g_block
+                exp_avg_new[start:end] = m_new
+
+                debug_info["muon_blocks"]["count"] += 1
+                debug_info["muon_blocks"]["grad_norm"] += g_block.norm().item() ** 2
+                debug_info["muon_blocks"]["exp_avg_norm"] += m_new.norm().item() ** 2
+
+            elif block["type"] == "adam":
+                # ^ AdamW Update
+                m_block = exp_avg[start:end]
+                m_new = self.adam_beta1 * m_block + (1 - self.adam_beta1) * g_block
+                exp_avg_new[start:end] = m_new
+
+                v_block = exp_avg_sq[start:end]
+                v_new = self.adam_beta2 * v_block + (1 - self.adam_beta2) * (g_block ** 2)
+                exp_avg_sq_new[start:end] = v_new
+
+                debug_info["adam_blocks"]["count"] += 1
+                debug_info["adam_blocks"]["grad_norm"] += g_block.norm().item() ** 2
+                debug_info["adam_blocks"]["exp_avg_norm"] += m_new.norm().item() ** 2
+                debug_info["adam_blocks"]["exp_avg_sq_mean"] += v_new.mean().item()
+        
+        # === DEBUG: Print summary (only every N steps to avoid spam) ===
+        if int(t_new.item()) % 100 == 0 or t_new.item() <= 2:  # Print at start and every 100 steps
+            print(f"\n[Muon update_state] Step t={int(t_new.item())}", flush=True)
+            
+            # Muon blocks summary
+            if debug_info["muon_blocks"]["count"] > 0:
+                muon_grad_rms = (debug_info["muon_blocks"]["grad_norm"] / debug_info["muon_blocks"]["count"]) ** 0.5
+                muon_exp_avg_rms = (debug_info["muon_blocks"]["exp_avg_norm"] / debug_info["muon_blocks"]["count"]) ** 0.5
+                print(f"  [Muon blocks] count={debug_info['muon_blocks']['count']}", flush=True)
+                print(f"    └─ grad RMS      = {muon_grad_rms:.6e}", flush=True)
+                print(f"    └─ exp_avg RMS   = {muon_exp_avg_rms:.6e}", flush=True)
+            
+            # AdamW blocks summary
+            if debug_info["adam_blocks"]["count"] > 0:
+                adam_grad_rms = (debug_info["adam_blocks"]["grad_norm"] / debug_info["adam_blocks"]["count"]) ** 0.5
+                adam_exp_avg_rms = (debug_info["adam_blocks"]["exp_avg_norm"] / debug_info["adam_blocks"]["count"]) ** 0.5
+                adam_exp_avg_sq_mean = debug_info["adam_blocks"]["exp_avg_sq_mean"] / debug_info["adam_blocks"]["count"]
+                print(f"  [AdamW blocks] count={debug_info['adam_blocks']['count']}", flush=True)
+                print(f"    ├─ grad RMS      = {adam_grad_rms:.6e}", flush=True)
+                print(f"    ├─ exp_avg RMS   = {adam_exp_avg_rms:.6e}", flush=True)
+                print(f"    └─ exp_avg_sq    = {adam_exp_avg_sq_mean:.6e}", flush=True)
+            
+            # Overall gradient norm
+            total_grad_norm = gradient.norm().item()
+            print(f"  [Overall] Total gradient norm = {total_grad_norm:.6e}\n", flush=True)
+        # ================================================================
+
+        # * Construct the new state
+        new_state = {
+            "t": t_new,
+            "exp_avg": exp_avg_new,
+            "exp_avg_sq": exp_avg_sq_new,
+        }
+
+        flat_new_state = flatten_pytree(new_state)[0]
+        return flat_new_state
 
     def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
         """
@@ -550,7 +632,7 @@ class BlockDiagonalPreconditioner(Preconditioner):
         self.total_size = sum(b["size"] for b in blocks)
         
         # === DEBUG INFO ===
-        print("\n[BlockDiagonalPreconditioner] Created with structure:")
+        """print("\n[BlockDiagonalPreconditioner] Created with structure:")
         for i, b in enumerate(blocks):
             btype = b["type"]
             size = b["size"]
@@ -559,7 +641,7 @@ class BlockDiagonalPreconditioner(Preconditioner):
                 print(f"  Block {i:2d}: {name:25s} | IDENTITY   | size={size:6d}")
             else:
                 print(f"  Block {i:2d}: {name:25s} | DIAGONAL   | size={size:6d} | mean={b['data'].mean().item():.6f}")
-        print(f"[BlockDiagonalPreconditioner] Total size: {self.total_size}\n")
+        print(f"[BlockDiagonalPreconditioner] Total size: {self.total_size}\n")"""
     
     def __call__(self, v: Array) -> Array:
         """Apply the preconditioner: compute P @ v.
@@ -600,6 +682,7 @@ class BlockDiagonalPreconditioner(Preconditioner):
         Returns:
             A new BlockDiagonalPreconditioner with each block raised to the power.
         """
+        print(f"[BlockDiagonalPreconditioner] Raising preconditioner to power {power}", flush=True)
         new_blocks = []
         
         for block in self.blocks:
@@ -614,6 +697,7 @@ class BlockDiagonalPreconditioner(Preconditioner):
             
             new_blocks.append(new_block)
         
+        print(f"[BlockDiagonalPreconditioner] Completed power operation", flush=True)
         return BlockDiagonalPreconditioner(new_blocks)
 
 
