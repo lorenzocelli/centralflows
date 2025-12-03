@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 import numpy as np
 import torch
@@ -10,6 +10,81 @@ from .utils import flatten_pytree
 
 
 Array = Any
+
+
+def _unflatten_helper(flat_tensor: torch.Tensor, shapes: List[torch.Size]) -> List[torch.Tensor]:
+    """Unflatten a flat tensor into a list of tensors with given shapes.
+
+    Args:
+        flat_tensor: Flat 1D tensor
+        shapes: List of shapes for each tensor
+
+    Returns:
+        List of tensors with the specified shapes
+    """
+    tensors = []
+    cursor = 0
+    for shape in shapes:
+        size = np.prod(shape)
+        tensors.append(flat_tensor[cursor:cursor+size].reshape(shape))
+        cursor += size
+    return tensors
+
+
+def newton_schulz(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Compute the inverse square root of G^T G using Newton-Schulz iteration.
+
+    This computes M = (G^T G)^{-1/2} using the Newton-Schulz algorithm.
+
+    Args:
+        G: Input matrix (can be non-square)
+        steps: Number of Newton-Schulz iterations
+        eps: Small constant for numerical stability
+
+    Returns:
+        M: The matrix (G^T G)^{-1/2}
+    """
+    # Compute G^T G
+    a = G.T @ G
+
+    # Normalize by the trace to improve conditioning
+    # This helps the iteration converge to the correct solution
+    dim = a.shape[0]
+    normalization = a.trace() / dim + eps
+    a = a / normalization
+
+    # Initialize: I is the starting point
+    # We're computing the inverse sqrt, so we start with identity
+    Y = torch.eye(dim, dtype=a.dtype, device=a.device)
+
+    # Newton-Schulz iteration: Y_{k+1} = Y_k * (3I - a @ Y_k^2) / 2
+    # This converges to a^{-1/2}
+    I = torch.eye(dim, dtype=a.dtype, device=a.device)
+    for _ in range(steps):
+        Y = Y @ (3 * I - a @ Y @ Y) / 2
+
+    # Undo the normalization
+    return Y / torch.sqrt(normalization)
+
+
+def matrix_power(M: torch.Tensor, p: float) -> torch.Tensor:
+    """Compute M^p for a matrix M using SVD.
+
+    Args:
+        M: Square matrix
+        p: Power (can be fractional)
+
+    Returns:
+        M^p
+    """
+    # Use SVD: M = U S V^T
+    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+
+    # Compute S^p (element-wise power on singular values)
+    S_p = S ** p
+
+    # Reconstruct: M^p = U S^p V^T
+    return U @ torch.diag(S_p) @ Vh
 
 
 class UpdateRule:
@@ -300,187 +375,111 @@ class Muon(UpdateRule):
     """
     The Muon optimizer.
 
-    This class is the entire Muon optimizer, hence it should deal with ALL PARAMETERS together,
-    and internally should handle the difference between 2D (layers) and 1D (biases) parameters.
+    Muon uses a hybrid approach:
+    - 2D+ parameters: Momentum + Muon preconditioner (Newton-Schulz orthogonalization)
+    - 1D parameters: Plain SGD with momentum (Identity preconditioner)
 
-    In particular, 1D parameters should be assigned an AdamW-like update rule, while 2D parameters should
-    compute the Muon preconditioner.
-
-    Hence, the state should contain both the AdamW state for the 1D parameters, as well as the Muon state for the 2D parameters.
+    This matches the original Muon paper's approach.
     """
-
-    # ^ Generic parameters
     lr: float
-
-    # ^ Muon parameters
     momentum: float = 0.95
-    nesterov: bool = True
-
-    # ^ AdamW parameters
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_eps: float = 1e-8
-    weight_decay: float = 0.01
+    ns_steps: int = 5  # Newton-Schulz iteration steps
+    shapes: List[torch.Size] = None  # Will be set during initialization
 
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
-        self.unflatten_fn = None
 
     def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
-        """
-        This function should initialize the state (t [scalar], momentum [for all parameters, shape of w], 
-                        variance [for 1D parameters only, shape of w, with 0s for 2D parameters])
+        """Initialize Muon optimizer state.
 
-        The unflatten function is required to obtain the dictionary of the parameters
-        
         Args:
-            w: the initial weights
-            unflatten: function to unflatten the weights into a pytree (dict of tensors) [optional]
+            w: Initial weights (flat)
+            unflatten: Function to unflatten weights (required to extract shapes)
+
+        Returns:
+            Flat state vector
         """
         if unflatten is None:
             raise ValueError("unflatten function must be provided to initialize Muon optimizer state.")
-        self.unflatten_fn = unflatten
 
-        params = self.unflatten_fn(w)
+        # Extract shapes from the unflattened parameters
+        params = unflatten(w)
+        self.shapes = [p.shape for p in params.values()]
 
-        self.param_blocks = []
-        cursor = 0
-
-        for name, p in params.items():
-            numel = p.numel()
-            start = cursor
-            end = cursor + numel
-
-            block_type = "muon" if p.ndim >= 2 else "adam"
-
-            self.param_blocks.append({
-                "name": name,
-                "type": block_type,
-                "idx": (start, end),
-                "shape": tuple(p.shape),
-                "ndim": p.ndim,
-            })
-
-            cursor = end
-
+        # Initialize state: momentum for all parameters, step counter
         state = {
-            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
-            "momentum": torch.zeros_like(w),         #!  used for ALL parameters
-            "exp_avg": torch.zeros_like(w),          #!  used only for AdamW blocks
-            "exp_avg_sq": torch.zeros_like(w),       #!  used only for AdamW blocks
+            "momentum": torch.zeros_like(w),
+            "step": torch.tensor(0.0, dtype=w.dtype, device=w.device)
         }
-
-        # ------------------------- DEBUG BLOCK -------------------------
-        print("\n[Muon Initialize] Parameter Block Summary:")
-        count_muon = 0
-        count_adam = 0
-
-        for b in self.param_blocks:
-            name = b["name"]
-            btype = b["type"]
-            s, e = b["idx"]
-            shape = b["shape"]
-
-            if btype == "muon":
-                count_muon += 1
-            else:
-                count_adam += 1
-
-            print(f"  - {name:25s} | {btype.upper():5s} | idx=({s},{e}) | shape={shape}")
-
-        print(f"\n[Muon Initialize] TOTAL blocks: {len(self.param_blocks)}")
-        print(f"   - Muon (2D+) blocks : {count_muon}")
-        print(f"   - AdamW (1D) blocks : {count_adam}")
-        print(f"   - Total parameters  : {w.numel()} entries")
-        print("[Muon Initialize] Flat state created with fields: t, momentum, exp_avg, exp_avg_sq\n")
-        # ---------------------------------------------------------------
-
-        # * Remember to store the unflatten function (different from the unflatten_fn) for later use
-        # * self.unflatten -> function to unflatten the optimizer state
-        # * self.unflatten_fn -> function to unflatten the model parameters
         flat_state, self.unflatten = flatten_pytree(state)
-
-        # ------------------------- TEST BLOCK -------------------------
-        print("\n[Muon Test] Testing P construction...")
-        test_P = self.P(flat_state)
-        
-        # Test 1: Size consistency
-        assert test_P.total_size == w.numel(), f"P size mismatch: {test_P.total_size} vs {w.numel()}"
-        print(f"[Muon Test] ✓ P.total_size matches w.numel() = {w.numel()}")
-        
-        # Test 2: Forward pass (P @ ones)
-        test_vec = torch.ones_like(w)
-        result = test_P(test_vec)
-        assert result.shape == w.shape, f"P(v) shape mismatch: {result.shape} vs {w.shape}"
-        print(f"[Muon Test] ✓ P(ones) has correct shape")
-        
-        # Test 3: Inverse (P^-1 @ ones)
-        P_inv = test_P.pow(-1)
-        result_inv = P_inv(test_vec)
-        print(f"[Muon Test] ✓ P^-1(ones) computed successfully")
-        print(f"[Muon Test]   P^-1(ones) stats: mean={result_inv.mean():.6f}, std={result_inv.std():.6f}")
-        
-        print("[Muon Test] All tests passed!\n")
-        # --------------------------------------------------------------
         return flat_state
 
-    def P(self, flat_state: Array) -> Array:
-        """This function should do a distinction between 1D and 2D parameters,
-        and build the block-diagonal preconditioner accordingly. For the 1D parameters, 
-        should use AdamW preconditioner, while for the 2D parameters should compute the Muon preconditioner.
+    def P(self, flat_state: Array) -> Preconditioner:
+        """Build the hybrid preconditioner.
+
+        Args:
+            flat_state: Current optimizer state (flat)
+
+        Returns:
+            HybridPreconditioner with Muon blocks for 2D params, Identity for 1D
         """
+        # 1. Unpack state
         state = self.unflatten(flat_state)
-        t = state["t"]
-        exp_avg_sq = state["exp_avg_sq"] # should be the variance buffer
+        momentum = state["momentum"]
 
-        lr = self.lr_fn(t)
+        # 2. Unflatten momentum to access per-layer gradients
+        mom_tensors = _unflatten_helper(momentum, self.shapes)
 
-        P_diag_blocks = []
-        for block in self.param_blocks:
-            block_type = block["type"]
-            start_idx, end_idx = block["idx"]
-            block_size = end_idx - start_idx
+        # 3. Build the Mixed Preconditioner list
+        preconditioner_blocks = []
 
-            if block_type == "muon":
-                # TODO implement muon case
-                # This is not the final implementation, just a placeholder
-                P_diag_blocks.append({
-                    "type": "identity",
-                    "size": block_size,
-                    "data": None,
-                    "name": block["name"],
-                    "scale": 1.0 / lr
-                })
-            elif block_type == "adam":
-                # * Extract the v for this specific block
-                v_block = exp_avg_sq[start_idx:end_idx]
-                P_block = (torch.sqrt(v_block) + self.adam_eps) / lr
+        for m in mom_tensors:
+            if m.ndim >= 2:
+                # --- CASE A: MUON LAYER ---
+                # Calculate M = (G^T G)^{-1/2}
+                # We use Newton-Schulz on the momentum matrix
+                M = newton_schulz(m, steps=self.ns_steps)
+                preconditioner_blocks.append(M)
+            else:
+                # --- CASE B: AUX LAYER (SGD) ---
+                # For SGD, the preconditioner is Identity (1.0).
+                preconditioner_blocks.append(1.0)
 
-                P_diag_blocks.append({
-                    "type": "diagonal",
-                    "size": block_size,
-                    "data": P_block,
-                    "name": block["name"]
-                })
-        return BlockDiagonalPreconditioner(P_diag_blocks)
+        return HybridPreconditioner(preconditioner_blocks, self.shapes)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
-        """This function should update the state accordingly:
-        - for t, increment by 1
-        - for momentum, update for ALL parameters
-        - for variance, update only for 1D parameters
-        """
-        raise NotImplementedError()
+        """Update momentum state.
 
-    def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
+        Standard momentum update for ALL parameters (both 1D and 2D).
+
+        Args:
+            flat_state: Current state
+            gradient: Current gradient
+
+        Returns:
+            Updated state
         """
-        Perform the full optimization step.
-        
-        OVERRIDE REQUIRED: We cannot rely on the base class implementation (w - P_inv * g) because
-        Muon and AdamW apply updates to the Momentum, not the raw Gradient, and Muon uses a non-linear
-        orthogonalization step.
+        state = self.unflatten(flat_state)
+        new_mom = state["momentum"] * self.momentum + gradient
+
+        new_state = {"momentum": new_mom, "step": state["step"] + 1}
+        return flatten_pytree(new_state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Dict[str, Any]:
+        """Summarize current optimizer state.
+
+        Args:
+            flat_state: Current state
+
+        Returns:
+            Dictionary with state summary
         """
-        raise NotImplementedError()
+        state = self.unflatten(flat_state)
+        return {
+            "step": state["step"],
+            "lr": self.lr_fn(state["step"]),
+            "momentum_norm": state["momentum"].norm().item(),
+        }
 
 class Preconditioner:
     """Abstract class for a preconditioner."""
@@ -510,10 +509,10 @@ class Preconditioner:
 
 class DiagonalPreconditioner(Preconditioner):
     """A diagonal (i.e. elementwise) preconditioner."""
-    
+
     def __init__(self, P):
         """Constructor for the diagonal preconditioner.
-        
+
         Args:
           P (Array): the diagonal preconditioner, as a vector
         """
@@ -526,96 +525,82 @@ class DiagonalPreconditioner(Preconditioner):
         return DiagonalPreconditioner(self.P**power)
 
 
-class BlockDiagonalPreconditioner(Preconditioner):
-    """A block-diagonal preconditioner.
-
-    The preconditioner is represented as a list of blocks, where each block
-    can be either an Identity matrix (for Muon) or a Diagonal matrix (for AdamW).
+@dataclass
+class HybridPreconditioner(Preconditioner):
     """
-    # TODO CHANGE DESCRIPTION, FOR NOW IT'S OK BUT MUON IS NOT IDENTITY IN FINAL VERSION
+    Applies Muon logic to 2D blocks and Identity/SGD logic to 1D blocks.
 
-    def __init__(self, blocks: list[dict]):
-        """Constructor for the block-diagonal preconditioner.
-        
-        Args:
-            blocks: List of dicts, each containing:
-                - "type": "identity" or "diagonal"
-                - "size": number of parameters in this block
-                - "data": None (for identity) or torch.Tensor (for diagonal)
-                - "name": parameter name (for debugging)
-        """
-        self.blocks = blocks
-        
-        # Precompute total size for validation
-        self.total_size = sum(b["size"] for b in blocks)
-        
-        # === DEBUG INFO ===
-        print("\n[BlockDiagonalPreconditioner] Created with structure:")
-        for i, b in enumerate(blocks):
-            btype = b["type"]
-            size = b["size"]
-            name = b["name"]
-            if btype == "identity":
-                print(f"  Block {i:2d}: {name:25s} | IDENTITY   | size={size:6d}")
-            else:
-                print(f"  Block {i:2d}: {name:25s} | DIAGONAL   | size={size:6d} | mean={b['data'].mean().item():.6f}")
-        print(f"[BlockDiagonalPreconditioner] Total size: {self.total_size}\n")
-    
+    This preconditioner handles mixed parameter types:
+    - 2D+ parameters: Uses Muon preconditioner (matrix M from Newton-Schulz)
+    - 1D parameters: Uses scalar preconditioner (typically 1.0 for SGD)
+    """
+    blocks: List[Any]  # List of M matrices or Scalars
+    shapes: List[torch.Size]
+    internal_power: float = 1.0
+
     def __call__(self, v: Array) -> Array:
-        """Apply the preconditioner: compute P @ v.
-        
-        Args:
-            v: vector of size (total_size,)
-        
-        Returns:
-            P @ v
-        """
-        if v.numel() != self.total_size:
-            raise ValueError(f"Input vector size {v.numel()} doesn't match preconditioner size {self.total_size}")
-        
-        result_blocks = []
-        cursor = 0
-        
-        for block in self.blocks:
-            size = block["size"]
-            v_block = v[cursor:cursor+size]
-            
-            if block["type"] == "identity":
-                # Identity: P @ v = v
-                result_blocks.append(v_block)
-            else:  # diagonal
-                # Diagonal: P @ v = diag * v (element-wise)
-                result_blocks.append(block["data"] * v_block)
-            
-            cursor += size
-        
-        return torch.cat(result_blocks, dim=0)
-    
-    def pow(self, power: float) -> BlockDiagonalPreconditioner:
-        """Return P^power (each block raised to the power).
-        
-        Args:
-            power: the exponent
-        
-        Returns:
-            A new BlockDiagonalPreconditioner with each block raised to the power.
-        """
-        new_blocks = []
-        
-        for block in self.blocks:
-            new_block = block.copy()
-            
-            if block["type"] == "identity":
-                # Identity^p = Identity
-                new_block["data"] = None
-            else:  # diagonal
-                # (Diagonal)^p = element-wise power
-                new_block["data"] = block["data"] ** power
-            
-            new_blocks.append(new_block)
-        
-        return BlockDiagonalPreconditioner(new_blocks)
+        """Apply P to vector v.
 
+        Args:
+            v: Flat vector to precondition
+
+        Returns:
+            P @ v (using internal_power)
+        """
+        return self._apply(v, power=self.internal_power)
+
+    def pow(self, p: float) -> HybridPreconditioner:
+        """Create new preconditioner with power p.
+
+        Args:
+            p: Power to raise the preconditioner to
+
+        Returns:
+            New HybridPreconditioner with internal_power = p
+        """
+        return HybridPreconditioner(self.blocks, self.shapes, internal_power=p)
+
+    def _apply(self, v_flat: Array, power: float) -> Array:
+        """Apply P^power to a flat vector.
+
+        Args:
+            v_flat: Flat vector
+            power: Power to apply
+
+        Returns:
+            Result of applying P^power to v_flat
+        """
+        # 1. Slice v_flat into per-layer tensors
+        v_tensors = _unflatten_helper(v_flat, self.shapes)
+
+        out_tensors = []
+
+        for v, block in zip(v_tensors, self.blocks):
+            if isinstance(block, torch.Tensor):
+                # --- MUON BLOCK ---
+                # block is M = (G^T G)^{-1/2}
+                # We need P^power. P is M^{-1}. So we need M^{-power}.
+
+                # If power = -1 (Standard Step): M^1. Result = v @ M
+                # If power = -0.5 (Eig Solver): M^0.5. Result = v @ M^0.5
+
+                # Compute fractional power of M (using SVD for stability)
+                # Note: For integer powers like -1, we can just multiply/inverse.
+                op = matrix_power(block, -power)
+                out_tensors.append(v @ op)
+
+            else:
+                # --- SGD BLOCK ---
+                # block is scalar (e.g., 1.0 for SGD)
+                # Result = v * (block ^ power)
+
+                # If SGD: block=1.0. 1.0^(-1) = 1.0. No change.
+                if isinstance(block, float) and block == 1.0:
+                    out_tensors.append(v)  # Identity
+                else:
+                    out_tensors.append(v * (block ** power))
+
+        return torch.cat([t.reshape(-1) for t in out_tensors])
 
 
 def to_schedule(schedule_or_constant):
