@@ -151,8 +151,8 @@ class DiscreteProcess(Process):
         return dict(times=timer.times, eig_logs=eig_logs)
 
     def step(self):
-        P = self.opt.P(self.state)
-        self.w -= P.pow(-1)(self.gradient)
+    # Delegate the update logic to the optimizer class (which handles momentum vs gradient)
+        self.w, self.state = self.opt.update(self.w, self.state, self.gradient)
 
 
 @dataclass
