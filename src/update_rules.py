@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -12,26 +12,130 @@ from .utils import flatten_pytree
 Array = Any
 
 
+def newtonschulz_step(G: torch.Tensor, steps: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Performs the Newton-Schulz iteration to compute the Muon update and the explicit
+    preconditioner matrix.
+
+    DESIGN CHOICE: "Parallel Identity" Algorithm
+    --------------------------------------------
+    Standard Muon only computes the update X_K = P^{-1} G_0. However, to analyze eigenvalues
+    of P^{-1}H, we need the explicit operator P^{-1}.
+    This function runs a parallel iteration on an accumulator matrix A (initialized to Identity)
+    applying the same transformations B(X_k) to A that are applied to X.
+    By linearity, if X_{k+1} = B(X_k) X_k, then A_{final} satisfies X_{final} = A_{final} G_0.
+    Thus, A_final is the explicit matrix form of P^{-1}.
+
+    Mathematical Notation (from Proposal):
+    - Input G is the gradient block G_0 (or momentum).
+    - X tracks the iterates X_k, converging to the orthogonalized update.
+    - A tracks the preconditioner P_{Muon}^{-1}(G_0).
+    - The polynomial update is B(X) = alpha*I + beta*XX^T + gamma*(XX^T)^2.
+
+    Args:
+        G (Tensor): The input matrix G_0 (usually momentum).
+        steps (int): Number of Newton-Schulz steps (usually 5).
+
+    Returns:
+        X (Tensor): The final update step X_K approx P^{-1} G_0.
+        A (Tensor): The explicit left-preconditioner matrix P_{Muon}^{-1}(G_0).
+    """
+    assert G.ndim == 2
+    m, n = G.shape
+    
+    # 1. Normalization
+    # We define the scaling factor c = ||G_0||_F + epsilon.
+    # To ensure stability, inputs to Newton-Schulz must have spectral norm < 1.
+    norm = G.norm(dim=(-2, -1), keepdim=True) + 1e-7
+    
+    # Initialize iterates.
+    # We delay the final Muon scaling factor (sqrt(m/n)) until the end to avoid
+    # exploding values during the iteration if m >> n.
+    # X_0 = (1/c) * G_0
+    X = G / norm
+    
+    # Initialize the accumulator A.
+    # Since X_0 = (1/c) * I * G_0, the operator starts as A_0 = (1/c) * I.
+    A = torch.eye(m, dtype=G.dtype, device=G.device) / norm
+
+    # Quintic coefficients for the polynomial B(X).
+    # These correspond to alpha, beta, gamma in the proposal's update rule.
+    a, b, c = (3.4445, -4.7750, 2.0315)
+
+    # 2. Iteration
+    for _ in range(steps):
+        # Compute X_k * X_k^T
+        XXt = X @ X.mT
+        
+        # Compute the polynomial B(X_k) = alpha*I + beta*XX^T + gamma*(XX^T)^2
+        # This operator is symmetric and depends only on the singular values of X_k.
+        B = a * torch.eye(m, device=G.device, dtype=G.dtype) + \
+            b * XXt + \
+            c * (XXt @ XXt)
+            
+        # Update X: X_{k+1} = B(X_k) @ X_k
+        X = B @ X
+        
+        # Update A: A_{k+1} = B(X_k) @ A_k
+        # We apply the exact same left-operator B(X_k) to A.
+        # This preserves the invariant X_k = A_k @ G_0.
+        A = B @ A
+
+    # 3. Muon Scaling
+    # The proposal defines the final update as scaled by sqrt(max(1, m/n)).
+    # We apply this scalar factor to both the update X and the operator A
+    # so that X = A @ G_0 still holds.
+    if m > n:
+        scale = (m / n) ** 0.5
+        X = X * scale
+        A = A * scale
+        
+    return X, A
+
+
+def matrix_power(M: torch.Tensor, p: float, eps: float = 1e-3) -> torch.Tensor:
+    """
+    Computes M^p for a symmetric matrix M using SVD/Eigendecomposition.
+    Used to compute P^{-1/2} from P^{-1} for eigenvalue analysis.
+    
+    Args:
+        M: Square matrix.
+        p: Power (e.g., 0.5 for sqrt, -1 for inverse).
+        eps: Epsilon for stability.
+    """
+    # Use SVD: M = U S V^T. Since M is symmetric (P^-1 approx), U=V.
+    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+
+    # Clamp singular values for numerical stability
+    S = torch.clamp(S, min=eps)
+
+    # Compute S^p element-wise
+    S_p = S ** p
+
+    # Reconstruct
+    return U @ torch.diag(S_p) @ Vh
+
+
 class UpdateRule:
     """Abstract class for an update rule that defines an optimization algorithm.
-    
+
     Specifically, this is for optimization algorithms that perform preconditioned
     gradient descent:
            w_{t+1} = w_t - P^{-1}_t ∇L(w_t)
     where the preconditioner P_t depends on some evolving state.
-    
-    This formulation encompasses gradient descent with a fixed learning rate (a trivial special case 
+
+    This formulation encompasses gradient descent with a fixed learning rate (a trivial special case
     with P_t = 1/η I), gradient descent with a learning rate schedule, Scalar RMSProp, and RMSProp.
-    
+
     The functional design here is inspired by Jax's Optax library.
     """
-        
+
     def initialize_state(self, w: torch.Tensor, unflatten: Any = None) -> Array:
         """Initialize the state.
-        
+
         Args:
           w: the initial weights
-          
+
         Returns:
           Array: the state, as a flat vector (see subclasses for examples)
         """
@@ -39,10 +143,10 @@ class UpdateRule:
 
     def P(self, flat_state: Array) -> Preconditioner:
         """Return the current preconditioner.
-        
+
         Args:
           flat_state (Array): the current state, as a flat vector
-        
+
         Returns:
           Preconditioner: the current preconditioner
         """
@@ -50,11 +154,11 @@ class UpdateRule:
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         """Update the state (discrete time).
-        
+
         Args:
           flat_state (Array): the current state, as a flat vector
           gradient (Array): the current gradient
-        
+
         Returns:
           Array: the next state
         """
@@ -62,11 +166,11 @@ class UpdateRule:
 
     def dstate_dt(self, flat_state: Array, gradient: Array):
         """Update the state (continuous time).
-        
+
         Args:
           flat_state (Array): the current state, as a flat vector
           gradient (Array): the current gradient
-        
+
         Returns:
           Array: the time derivative of the state
         """
@@ -74,10 +178,10 @@ class UpdateRule:
 
     def summarize_state(self, flate_state: Array) -> Dict[str, Any]:
         """Summarize the state.
-        
+
         Args:
           flat_state (Array): the current state, as a flat vector
-          
+
         Returns:
           Dict[str, Any]: a dictionary with a summary of the current state.
         """
@@ -90,17 +194,17 @@ class UpdateRule:
         return w, flat_state
 
 
-@dataclass # we make it a dataclass so that it can be instantiated from the command line
+@dataclass  # we make it a dataclass so that it can be instantiated from the command line
 class GradientDescent(UpdateRule):
-    """Gradient descent with a fixed or scheduled learning rate: 
+    """Gradient descent with a fixed or scheduled learning rate:
              w_{t+1} = w_t - η(t) ∇L(w_t)
     where η(t) is the learning rate at step t.
-    
+
     This is a special case of `UpdateRule` with P_t set to P_t = 1/η(t) I.
-    
+
     The state consists of the current step counter t (to support learning rate schedules).
     """
-    lr: float  # the learning rate
+    lr: float  # the learning rate 
 
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
@@ -127,40 +231,27 @@ class GradientDescent(UpdateRule):
         }
 
     def raw_eigs_from_eigs(self, flat_state: Array, eigs: Array):
-        """Given the top eigenvalues of the effective Hessian, return the top 
-        eigenvalues of the 'raw' Hessian.
-        
-        This function is used by the 'raw' Hessian eigenvalue logger.
-        
-        Args:
-          flate_state (Array): the current state, as a flattened vector
-          eigs (Array): the top eigenvalues of the effective Hessian
-          
-        Returns:
-          (Array): the top eigenvalues of the 'raw' Hessian
-        """
         if eigs is None:
             return None
         lr = self.P(flat_state).pow(-1)(1.0)
         return eigs / lr
 
 
-@dataclass # we make it a dataclass so that it can be instantiated from the command line
+@dataclass
 class ScalarRMSProp(UpdateRule):
     """The Scalar RMSProp optimizer.
-    
+
     This optimizer maintains an EMA ν of the squared gradient norm,
     and takes gradient steps using the effective step size η/sqrt(ν).
     Our implementation supports optional learning rate scheduling,
     bias correction, and ε:
-    
+
            ν_{t} = (1 - β_2) ν_{t-1} + β_2 ||∇L(w_t)||^2
            ν̂_{t} = ν_t / (1 - β_2 ^ t)
            w_{t+1} = w_t - η(t) / sqrt (ν̂_t + ε) * ∇L(w_t)
-           
+
     The optimizer's state consists of the tuple (t, ν).
     """
-    
     lr: float
     beta2: float
     eps: float = 0.
@@ -196,7 +287,7 @@ class ScalarRMSProp(UpdateRule):
 
     def dstate_dt(self, flat_state: Array, gradient: Array) -> Array:
         update = self.update_state(flat_state, gradient) - flat_state
-        return update / self.beta2  # see footnote TODO in paper for explanation of this
+        return update / self.beta2 
 
     def summarize_state(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -209,40 +300,27 @@ class ScalarRMSProp(UpdateRule):
         }
 
     def raw_eigs_from_eigs(self, flat_state: Array, eigs: Array):
-        """Given the top eigenvalues of the effective Hessian, return the top 
-        eigenvalues of the 'raw' Hessian.
-        
-        This function is used by the 'raw' Hessian eigenvalue logger.
-        
-        Args:
-          flate_state (Array): the current state, as a flattened vector
-          eigs (Array): the top eigenvalues of the effective Hessian
-          
-        Returns:
-          (Array): the top eigenvalues of the Hessian
-        """
         if eigs is None:
             return None
-        ess = self.P(flat_state).pow(-1)(1.0) # effective step size
+        ess = self.P(flat_state).pow(-1)(1.0) 
         return eigs / ess
 
 
-@dataclass # we make it a dataclass so that it can be instantiated from the command line
+@dataclass
 class RMSProp(UpdateRule):
     """The RMSProp optimizer.
-    
-    This optimizer maintains an EMA ν of the elementwise squared gradient, 
+
+    This optimizer maintains an EMA ν of the elementwise squared gradient,
     and takes gradient steps using the effective step sizes η/sqrt(ν).
     Our implementation supports optional learning rate scheduling,
     bias correction, and ε:
-    
+
            ν_{t} = (1 - β_2) ν_{t-1} + β_2 ∇L(w_t)^2
            ν̂_{t} = ν_t / (1 - β_2 ^ t)
            w_{t+1} = w_t - η(t) / sqrt (ν̂_t + ε) * ∇L(w_t)
-           
+
     The optimizer's state consists of the tuple (t, ν).
     """
-    
     lr: float
     beta2: float
     eps: float = 0
@@ -278,7 +356,7 @@ class RMSProp(UpdateRule):
 
     def dstate_dt(self, flat_state: Array, gradient: Array) -> Array:
         update = self.update_state(flat_state, gradient) - flat_state
-        return update / self.beta2 # see footnote TODO in paper for explanation of this
+        return update / self.beta2
 
     def summarize_state(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -287,12 +365,11 @@ class RMSProp(UpdateRule):
         selected_idx = np.linspace(0, len(nu) - 1, 25, dtype=int)
         return {
             "t": state["t"],
-            "nu_l1": nu.sum(),                   # L1 norm of nu
-            "nu_selected_idx": nu[selected_idx], # selected indices of nu
-            "ess_mean": ess.mean(),              # mean of effective step sizes
-                                                 # harmonic mean of effective step sizes
+            "nu_l1": nu.sum(),                  
+            "nu_selected_idx": nu[selected_idx],
+            "ess_mean": ess.mean(),             
             "ess_harmonic_mean": ess.reciprocal().mean().reciprocal(),
-            "lr": self.lr_fn(state["t"]), # current learning rate
+            "lr": self.lr_fn(state["t"]),
         }
 
 @dataclass
@@ -300,23 +377,25 @@ class Muon(UpdateRule):
     """
     The Muon optimizer.
 
-    This class is the entire Muon optimizer, hence it should deal with ALL PARAMETERS together,
-    and internally should handle the difference between 2D (layers) and 1D (biases) parameters.
+    DESIGN CHOICE: Hybrid Optimization
+    ----------------------------------
+    This class treats parameters differently based on their dimensions:
+    1. 2D+ parameters (Weights): Optimized via the Muon Newton-Schulz preconditioner.
+    2. 1D parameters (Biases, LayerNorm): Optimized via standard AdamW.
 
-    In particular, 1D parameters should be assigned an AdamW-like update rule, while 2D parameters should
-    compute the Muon preconditioner.
-
-    Hence, the state should contain both the AdamW state for the 1D parameters, as well as the Muon state for the 2D parameters.
+    Hence, the optimizer state tracks both:
+    - `exp_avg`: Momentum (used by both Muon and AdamW blocks).
+    - `exp_avg_sq`: Variance (used only by AdamW blocks).
     """
 
-    # ^ Generic parameters
+    # Generic parameters
     lr: float
 
-    # ^ Muon parameters
+    # Muon parameters
     momentum: float = 0.95
     nesterov: bool = True
 
-    # ^ AdamW parameters
+    # AdamW parameters
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
@@ -324,24 +403,18 @@ class Muon(UpdateRule):
 
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
-        self.unflatten_fn = None
+        self.unflatten_params = None
 
     def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
         """
-        This function should initialize the state (t [scalar], momentum [for all parameters, shape of w], 
-                        variance [for 1D parameters only, shape of w, with 0s for 2D parameters])
-
-        The unflatten function is required to obtain the dictionary of the parameters
-        
-        Args:
-            w: the initial weights
-            unflatten: function to unflatten the weights into a pytree (dict of tensors) [optional]
+        Initializes the optimizer state.
+        Determines which parameters are 'Muon blocks' (2D+) and which are 'Adam blocks' (1D).
         """
         if unflatten is None:
             raise ValueError("unflatten function must be provided to initialize Muon optimizer state.")
-        self.unflatten_fn = unflatten
+        self.unflatten_params = unflatten
 
-        params = self.unflatten_fn(w)
+        params = self.unflatten_params(w)
 
         self.param_blocks = []
         cursor = 0
@@ -351,6 +424,9 @@ class Muon(UpdateRule):
             start = cursor
             end = cursor + numel
 
+            # DESIGN CHOICE:
+            # Matrices (ndim >= 2) get the Muon preconditioner.
+            # Vectors (ndim < 2) get the AdamW preconditioner.
             block_type = "muon" if p.ndim >= 2 else "adam"
 
             self.param_blocks.append({
@@ -365,116 +441,77 @@ class Muon(UpdateRule):
 
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
-            "exp_avg": torch.zeros_like(w),          #!  used by BOTH Muon and AdamW blocks
-            "exp_avg_sq": torch.zeros_like(w),       #!  used only for AdamW blocks
+            "exp_avg": torch.zeros_like(w),          # Momentum buffer
+            "exp_avg_sq": torch.zeros_like(w),       # Variance buffer (Adam only)
         }
 
-        # ------------------------- DEBUG BLOCK -------------------------
-        print("\n[Muon Initialize] Parameter Block Summary:")
-        count_muon = 0
-        count_adam = 0
-
-        for b in self.param_blocks:
-            name = b["name"]
-            btype = b["type"]
-            s, e = b["idx"]
-            shape = b["shape"]
-
-            if btype == "muon":
-                count_muon += 1
-            else:
-                count_adam += 1
-
-            print(f"  - {name:25s} | {btype.upper():5s} | idx=({s},{e}) | shape={shape}")
-
-        print(f"\n[Muon Initialize] TOTAL blocks: {len(self.param_blocks)}")
-        print(f"   - Muon (2D+) blocks : {count_muon}")
-        print(f"   - AdamW (1D) blocks : {count_adam}")
-        print(f"   - Total parameters  : {w.numel()} entries")
-        print("[Muon Initialize] Flat state created with fields: t, momentum, exp_avg, exp_avg_sq\n")
-        # ---------------------------------------------------------------
-
-        # * Remember to store the unflatten function (different from the unflatten_fn) for later use
-        # * self.unflatten -> function to unflatten the optimizer state
-        # * self.unflatten_fn -> function to unflatten the model parameters
-        flat_state, self.unflatten = flatten_pytree(state)
-
-        # ------------------------- TEST BLOCK -------------------------
-        print("\n[Muon Test] Testing P construction...")
-        test_P = self.P(flat_state)
-        
-        # Test 1: Size consistency
-        assert test_P.total_size == w.numel(), f"P size mismatch: {test_P.total_size} vs {w.numel()}"
-        print(f"[Muon Test] ✓ P.total_size matches w.numel() = {w.numel()}")
-        
-        # Test 2: Forward pass (P @ ones)
-        test_vec = torch.ones_like(w)
-        result = test_P(test_vec)
-        assert result.shape == w.shape, f"P(v) shape mismatch: {result.shape} vs {w.shape}"
-        print(f"[Muon Test] ✓ P(ones) has correct shape")
-        
-        # Test 3: Inverse (P^-1 @ ones)
-        P_inv = test_P.pow(-1)
-        result_inv = P_inv(test_vec)
-        print(f"[Muon Test] ✓ P^-1(ones) computed successfully")
-        print(f"[Muon Test]   P^-1(ones) stats: mean={result_inv.mean():.6f}, std={result_inv.std():.6f}")
-        
-        print("[Muon Test] All tests passed!\n")
-        # --------------------------------------------------------------
+        flat_state, self.unflatten_state = flatten_pytree(state)
         return flat_state
 
     def P(self, flat_state: Array) -> Array:
-        """This function should do a distinction between 1D and 2D parameters,
-        and build the block-diagonal preconditioner accordingly. For the 1D parameters, 
-        should use AdamW preconditioner, while for the 2D parameters should compute the Muon preconditioner.
         """
-        state = self.unflatten(flat_state)
+        Constructs the hybrid preconditioner object.
+
+        DESIGN CHOICE: Storage of Explicit P^{-1}
+        -----------------------------------------
+        Normally, an UpdateRule's P() returns the forward preconditioner P.
+        However, for Muon, the Newton-Schulz iteration naturally yields the *inverse*
+        preconditioner A = P_{Muon}^{-1}(G_0).
+        
+        Instead of inverting A (which would be unstable and unnecessary), we store 
+        A directly in the block and tag it as "muon_inverse". The logic in 
+        BlockDiagonalPreconditioner handles this inversion flag.
+        """
+        state = self.unflatten_state(flat_state)
         t = state["t"]
-        exp_avg_sq = state["exp_avg_sq"] # should be the variance buffer
-        print(f"[DEBUG P] t={t.item()}, exp_avg_sq shape={exp_avg_sq.shape}", flush=True)
+        exp_avg = state["exp_avg"]        
+        exp_avg_sq = state["exp_avg_sq"]  
 
         lr = self.lr_fn(t)
 
-        P_diag_blocks = []
-        print(f"[DEBUG P] Processing {len(self.param_blocks)} blocks", flush=True)
-        for i, block in enumerate(self.param_blocks):
-            print(f"[DEBUG P] Processing block {i}/{len(self.param_blocks)}: {block['name']} ({block['type']})", flush=True)
+        P_blocks = []
+
+        for block in self.param_blocks:
             block_type = block["type"]
             start_idx, end_idx = block["idx"]
             block_size = end_idx - start_idx
 
             if block_type == "muon":
-                # TODO implement muon case
-                # This is not the final implementation, just a placeholder
-                P_diag_blocks.append({
-                    "type": "identity",
+                # For Muon blocks, the "gradient" G_0 is the momentum.
+                m_flat = exp_avg[start_idx:end_idx]
+                m_tensor = m_flat.view(block["shape"])
+
+                # Compute Explicit P^-1 Matrix (A) via Parallel Newton-Schulz.
+                # We disregard X here; we only need the operator A.
+                _, A = newtonschulz_step(m_tensor, steps=5)
+
+                P_blocks.append({
+                    "type": "muon_inverse", # Tag: This block data IS ALREADY P^-1.
                     "size": block_size,
-                    "data": None,
-                    "name": block["name"],
-                    "scale": 1.0 / lr
+                    "data": A * lr,         # Store scaled P^{-1}
+                    "shape": block["shape"],
+                    "name": block["name"]
                 })
             elif block_type == "adam":
-                # * Extract the v for this specific block
+                # For Adam blocks, we compute standard diagonal preconditioning.
                 v_block = exp_avg_sq[start_idx:end_idx]
                 P_block = (torch.sqrt(v_block) + self.adam_eps) / lr
 
-                P_diag_blocks.append({
+                P_blocks.append({
                     "type": "diagonal",
                     "size": block_size,
-                    "data": P_block,
+                    "data": P_block,        # Store P
                     "name": block["name"]
                 })
-        print("[DEBUG P] Finished processing blocks, constructing BlockDiagonalPreconditioner", flush=True)
-        return BlockDiagonalPreconditioner(P_diag_blocks)
+
+        return BlockDiagonalPreconditioner(P_blocks)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
-        """This function should update the state accordingly:
-        - for t, increment by 1
-        - for momentum, update for ALL parameters
-        - for variance, update only for 1D parameters
         """
-        # * Get the current state
-        state = self.unflatten(flat_state)
+        Updates the internal state (momentum/variance) based on the raw gradient.
+        This happens BEFORE preconditioning.
+        """
+        state = self.unflatten_state(flat_state)
         t = state["t"]
         exp_avg = state["exp_avg"]
         exp_avg_sq = state["exp_avg_sq"]
@@ -483,27 +520,19 @@ class Muon(UpdateRule):
         exp_avg_new = exp_avg.clone()
         exp_avg_sq_new = exp_avg_sq.clone()
 
-        debug_info = {
-            "muon_blocks": {"count": 0, "grad_norm": 0.0, "exp_avg_norm": 0.0},
-            "adam_blocks": {"count": 0, "grad_norm": 0.0, "exp_avg_norm": 0.0, "exp_avg_sq_mean": 0.0}
-        }
-
         for block in self.param_blocks:
             start, end = block["idx"]
-            g_block = gradient[start:end] #! This is the gradient for the current block of parameters
+            g_block = gradient[start:end] 
 
             if block["type"] == "muon":
-                # ^ Muon Update (TODO IMPLEMENT)
+                # Muon: Update momentum only.
+                # m_{t+1} = mu * m_t + g_t
                 m_block = exp_avg[start:end]
                 m_new = self.momentum * m_block + g_block
                 exp_avg_new[start:end] = m_new
 
-                debug_info["muon_blocks"]["count"] += 1
-                debug_info["muon_blocks"]["grad_norm"] += g_block.norm().item() ** 2
-                debug_info["muon_blocks"]["exp_avg_norm"] += m_new.norm().item() ** 2
-
             elif block["type"] == "adam":
-                # ^ AdamW Update
+                # Adam: Update momentum and variance.
                 m_block = exp_avg[start:end]
                 m_new = self.adam_beta1 * m_block + (1 - self.adam_beta1) * g_block
                 exp_avg_new[start:end] = m_new
@@ -512,39 +541,6 @@ class Muon(UpdateRule):
                 v_new = self.adam_beta2 * v_block + (1 - self.adam_beta2) * (g_block ** 2)
                 exp_avg_sq_new[start:end] = v_new
 
-                debug_info["adam_blocks"]["count"] += 1
-                debug_info["adam_blocks"]["grad_norm"] += g_block.norm().item() ** 2
-                debug_info["adam_blocks"]["exp_avg_norm"] += m_new.norm().item() ** 2
-                debug_info["adam_blocks"]["exp_avg_sq_mean"] += v_new.mean().item()
-        
-        # === DEBUG: Print summary (only every N steps to avoid spam) ===
-        if int(t_new.item()) % 100 == 0 or t_new.item() <= 2:  # Print at start and every 100 steps
-            print(f"\n[Muon update_state] Step t={int(t_new.item())}", flush=True)
-            
-            # Muon blocks summary
-            if debug_info["muon_blocks"]["count"] > 0:
-                muon_grad_rms = (debug_info["muon_blocks"]["grad_norm"] / debug_info["muon_blocks"]["count"]) ** 0.5
-                muon_exp_avg_rms = (debug_info["muon_blocks"]["exp_avg_norm"] / debug_info["muon_blocks"]["count"]) ** 0.5
-                print(f"  [Muon blocks] count={debug_info['muon_blocks']['count']}", flush=True)
-                print(f"    └─ grad RMS      = {muon_grad_rms:.6e}", flush=True)
-                print(f"    └─ exp_avg RMS   = {muon_exp_avg_rms:.6e}", flush=True)
-            
-            # AdamW blocks summary
-            if debug_info["adam_blocks"]["count"] > 0:
-                adam_grad_rms = (debug_info["adam_blocks"]["grad_norm"] / debug_info["adam_blocks"]["count"]) ** 0.5
-                adam_exp_avg_rms = (debug_info["adam_blocks"]["exp_avg_norm"] / debug_info["adam_blocks"]["count"]) ** 0.5
-                adam_exp_avg_sq_mean = debug_info["adam_blocks"]["exp_avg_sq_mean"] / debug_info["adam_blocks"]["count"]
-                print(f"  [AdamW blocks] count={debug_info['adam_blocks']['count']}", flush=True)
-                print(f"    ├─ grad RMS      = {adam_grad_rms:.6e}", flush=True)
-                print(f"    ├─ exp_avg RMS   = {adam_exp_avg_rms:.6e}", flush=True)
-                print(f"    └─ exp_avg_sq    = {adam_exp_avg_sq_mean:.6e}", flush=True)
-            
-            # Overall gradient norm
-            total_grad_norm = gradient.norm().item()
-            print(f"  [Overall] Total gradient norm = {total_grad_norm:.6e}\n", flush=True)
-        # ================================================================
-
-        # * Construct the new state
         new_state = {
             "t": t_new,
             "exp_avg": exp_avg_new,
@@ -556,37 +552,59 @@ class Muon(UpdateRule):
 
     def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
         """
-        Perform the full optimization step.
+        Perform the full optimization step: w_{t+1} = w_t - P^{-1}(state) * update_vector.
         
-        OVERRIDE REQUIRED: We cannot rely on the base class implementation (w - P_inv * g) because
-        Muon and AdamW apply updates to the Momentum, not the raw Gradient, and Muon uses a non-linear
-        orthogonalization step.
+        DESIGN CHOICE: Update Vector Source
+        -----------------------------------
+        - For AdamW blocks, the update source is the Raw Gradient.
+        - For Muon blocks, the update source is the Momentum buffer.
         """
-        raise NotImplementedError()
+        # 1. Update state (Momentum / Variance)
+        flat_state = self.update_state(flat_state, gradient)
+
+        state = self.unflatten_state(flat_state)
+        exp_avg = state["exp_avg"]
+
+        # 2. Build the vector to be preconditioned
+        update_blocks = []
+
+        for block in self.param_blocks:
+            start_idx, end_idx = block["idx"]
+
+            if block["type"] == "muon":
+                # Muon applies P^-1 to the Momentum.
+                update_blocks.append(exp_avg[start_idx:end_idx])
+            elif block["type"] == "adam":
+                # Adam applies P^-1 to the Gradient.
+                update_blocks.append(gradient[start_idx:end_idx])
+
+        update_vector = torch.cat(update_blocks)
+
+        # 3. Apply Preconditioner P^{-1}
+        # .pow(-1) correctly handles the "muon_inverse" blocks by simply returning them.
+        preconditioned_update = self.P(flat_state).pow(-1)(update_vector)
+
+        # 4. Update Weights
+        w = w - preconditioned_update
+
+        return w, flat_state
+
+    def summarize_state(self, flat_state: Array) -> Dict[str, Any]:
+        state = self.unflatten_state(flat_state)
+        return {
+            "t": state["t"],
+            "lr": self.lr_fn(state["t"]),
+            "exp_avg_norm": state["exp_avg"].norm().item(),
+            "exp_avg_sq_mean": state["exp_avg_sq"].mean().item(),
+        }
 
 class Preconditioner:
     """Abstract class for a preconditioner."""
     
     def __call__(self, v: Array) -> Array:
-        """Precondition a vector.
-        
-        Args:
-          v: the vector to precondition
-          
-        Returns:
-          the preconditioned vector Pv
-        """
         raise NotImplementedError()
     
     def pow(self, p: float) -> Preconditioner:
-        """Return a new preconditioner which is this preconditioner raised to a power.
-        
-        Args:
-          p: the power
-        
-        Returns:
-          (Preconditioner): a new preconditioner
-        """
         raise NotImplementedError()
 
 
@@ -594,11 +612,6 @@ class DiagonalPreconditioner(Preconditioner):
     """A diagonal (i.e. elementwise) preconditioner."""
     
     def __init__(self, P):
-        """Constructor for the diagonal preconditioner.
-        
-        Args:
-          P (Array): the diagonal preconditioner, as a vector
-        """
         self.P = P
 
     def __call__(self, v: Array) -> Array:
@@ -609,49 +622,28 @@ class DiagonalPreconditioner(Preconditioner):
 
 
 class BlockDiagonalPreconditioner(Preconditioner):
-    """A block-diagonal preconditioner.
-
-    The preconditioner is represented as a list of blocks, where each block
-    can be either an Identity matrix (for Muon) or a Diagonal matrix (for AdamW).
     """
-    # TODO CHANGE DESCRIPTION, FOR NOW IT'S OK BUT MUON IS NOT IDENTITY IN FINAL VERSION
+    A block-diagonal preconditioner supporting hybrid Muon/AdamW blocks.
+
+    Block Types:
+    - "muon_inverse":
+        Holds the Explicit Matrix A = P^{-1}.
+        This block CANNOT be applied directly (forward P is not supported).
+        It is a storage state waiting for .pow(-1).
+    - "muon_matrix":
+        Holds a generic matrix M (e.g. A, or A^{0.5}).
+        This block CAN be applied via left-multiplication.
+    - "diagonal":
+        Holds a vector D (Standard AdamW).
+        Applied via element-wise multiplication.
+    """
 
     def __init__(self, blocks: list[dict]):
-        """Constructor for the block-diagonal preconditioner.
-        
-        Args:
-            blocks: List of dicts, each containing:
-                - "type": "identity" or "diagonal"
-                - "size": number of parameters in this block
-                - "data": None (for identity) or torch.Tensor (for diagonal)
-                - "name": parameter name (for debugging)
-        """
         self.blocks = blocks
-        
-        # Precompute total size for validation
         self.total_size = sum(b["size"] for b in blocks)
-        
-        # === DEBUG INFO ===
-        """print("\n[BlockDiagonalPreconditioner] Created with structure:")
-        for i, b in enumerate(blocks):
-            btype = b["type"]
-            size = b["size"]
-            name = b["name"]
-            if btype == "identity":
-                print(f"  Block {i:2d}: {name:25s} | IDENTITY   | size={size:6d}")
-            else:
-                print(f"  Block {i:2d}: {name:25s} | DIAGONAL   | size={size:6d} | mean={b['data'].mean().item():.6f}")
-        print(f"[BlockDiagonalPreconditioner] Total size: {self.total_size}\n")"""
     
     def __call__(self, v: Array) -> Array:
-        """Apply the preconditioner: compute P @ v.
-        
-        Args:
-            v: vector of size (total_size,)
-        
-        Returns:
-            P @ v
-        """
+        """Apply the preconditioner blocks to vector v."""
         if v.numel() != self.total_size:
             raise ValueError(f"Input vector size {v.numel()} doesn't match preconditioner size {self.total_size}")
         
@@ -662,11 +654,23 @@ class BlockDiagonalPreconditioner(Preconditioner):
             size = block["size"]
             v_block = v[cursor:cursor+size]
             
-            if block["type"] == "identity":
-                # Identity: P @ v = v
-                result_blocks.append(v_block)
+            if block["type"] == "muon_matrix":
+                # Apply explicit matrix multiplication: M @ v_block
+                # The matrix M is m x m. The vector v is flattened (m*n).
+                # We interpret v as (m, n) and apply M on the left: M @ V.
+                M = block["data"]
+                m, n = block["shape"]
+                
+                v_reshaped = v_block.view(m, n)
+                res = M @ v_reshaped
+                result_blocks.append(res.flatten())
+                
+            elif block["type"] == "muon_inverse":
+                # We hold P^-1, but the user asked to apply P.
+                # Inverting A is unstable and unnecessary for this codebase.
+                raise NotImplementedError("Applying forward P (inverting A) is not supported for Muon blocks. Use .pow(-1) first.")
+                
             else:  # diagonal
-                # Diagonal: P @ v = diag * v (element-wise)
                 result_blocks.append(block["data"] * v_block)
             
             cursor += size
@@ -674,37 +678,55 @@ class BlockDiagonalPreconditioner(Preconditioner):
         return torch.cat(result_blocks, dim=0)
     
     def pow(self, power: float) -> BlockDiagonalPreconditioner:
-        """Return P^power (each block raised to the power).
-        
-        Args:
-            power: the exponent
-        
-        Returns:
-            A new BlockDiagonalPreconditioner with each block raised to the power.
         """
-        print(f"[BlockDiagonalPreconditioner] Raising preconditioner to power {power}", flush=True)
+        Return a new preconditioner raised to power `p`.
+        
+        Crucial logic for Muon blocks:
+        Since we store A = P^{-1}, computing P^p means computing A^{-p}.
+        """
         new_blocks = []
         
         for block in self.blocks:
             new_block = block.copy()
             
-            if block["type"] == "identity":
-                # Identity^p = Identity
-                new_block["data"] = None
+            if block["type"] == "muon_inverse":
+                # Stored data is A = P^{-1}.
+                A = block["data"]
+                
+                if power == -1:
+                    # Request: P^{-1}. 
+                    # Logic: We already have A. Just change type to "muon_matrix".
+                    new_block["data"] = A
+                    new_block["type"] = "muon_matrix" 
+                    
+                elif power == -0.5:
+                    # Request: P^{-1/2}.
+                    # Logic: We need sqrt(P^{-1}) = sqrt(A).
+                    # A is an m x m matrix, so we use SVD/Eig to compute A^0.5.
+                    new_block["data"] = matrix_power(A, 0.5)
+                    new_block["type"] = "muon_matrix"
+                    
+                else:
+                    # General case: P^p = (P^{-1})^{-p} = A^{-p}
+                    new_block["data"] = matrix_power(A, -power)
+                    new_block["type"] = "muon_matrix"
+
+            elif block["type"] == "muon_matrix":
+                 # Already a generic matrix M. Compute M^p.
+                 new_block["data"] = matrix_power(block["data"], power)
+
             else:  # diagonal
                 # (Diagonal)^p = element-wise power
                 new_block["data"] = block["data"] ** power
             
             new_blocks.append(new_block)
         
-        print(f"[BlockDiagonalPreconditioner] Completed power operation", flush=True)
         return BlockDiagonalPreconditioner(new_blocks)
-
 
 
 def to_schedule(schedule_or_constant):
     """Optionally create an LR schedule from a constant LR."""
-    if callable(schedule_or_constant):          # if it's a schedule ...
-        return schedule_or_constant             #  ... do nothing.
-    else:                                       # but if it's a constant...
-        return lambda t: schedule_or_constant   # ... turn it into a schedule. 
+    if callable(schedule_or_constant):          
+        return schedule_or_constant             
+    else:                                       
+        return lambda t: schedule_or_constant

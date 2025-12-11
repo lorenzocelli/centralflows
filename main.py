@@ -174,35 +174,30 @@ def main(
             # step = initial_step + i
                         
             # save checkpoint if appropriate
-            print("[DEBUG] Checking checkpoint", flush=True)
             checkpointer.maybe_checkpoint(i, processes)
-            
+
             # collected data will go here
             out = defaultdict(lambda: {})
-            
+
             # for each process: prepare for the step
             for name in processes:
-                print(f"[DEBUG] Preparing process {name}", flush=True)
                 process_log = processes[name].prepare()
-                print(f"[DEBUG] Prepared process {name}", flush=True)
                 out[name].update(process_log)
-            
+
             # run group loggers
             for logger in group_loggers:
                 out.update(logger.log(processes))
-                
+
             # run individual loggers
             for name in processes:
                 for logger in process_loggers[name]:
                     out[name].update(logger.log(processes[name]))
-                                        
+
             # for each process: take the step
             for name in processes:
-                print(f"[DEBUG] Stepping process {name}", flush=True)
                 processes[name].step()
-                
+
             # save data to disk
-            print(f"[DEBUG] Saving data for step {i}", flush=True)
             data_saver.save(i, out)
 
 
