@@ -374,6 +374,7 @@ class RMSProp(UpdateRule):
 
 @dataclass
 class Muon(UpdateRule):
+    #! WARNING: For testing purposes, right now we should implement Muon using always AdamW (for all layers)
     """
     The Muon optimizer.
 
@@ -429,6 +430,9 @@ class Muon(UpdateRule):
             # Vectors (ndim < 2) get the AdamW preconditioner.
             block_type = "muon" if p.ndim >= 2 else "adam"
 
+            #! For testing purposes, we force all layers to be AdamW
+            block_type = "adam"
+
             self.param_blocks.append({
                 "name": name,
                 "type": block_type,
@@ -438,6 +442,12 @@ class Muon(UpdateRule):
             })
 
             cursor = end
+
+        # [DEBUG] Print block summary
+        adam_blocks = sum(1 for b in self.param_blocks if b["type"] == "adam")
+        muon_blocks = sum(1 for b in self.param_blocks if b["type"] == "muon")
+        total_2d = sum(1 for b in self.param_blocks if b["ndim"] >= 2)
+        print(f"[Muon Init] Total blocks: {len(self.param_blocks)} | Adam: {adam_blocks} | Muon: {muon_blocks} | 2D+: {total_2d}", flush=True)
 
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
@@ -470,6 +480,10 @@ class Muon(UpdateRule):
         lr = self.lr_fn(t)
 
         P_blocks = []
+        
+        # [DEBUG] Print preconditioner info only at first step
+        if t == 1.0:
+            print(f"[Muon P()] Step {int(t.item())}: Building preconditioner with lr={lr:.6f}", flush=True)
 
         for block in self.param_blocks:
             block_type = block["type"]
@@ -493,6 +507,7 @@ class Muon(UpdateRule):
                     "name": block["name"]
                 })
             elif block_type == "adam":
+                #! For testing purposes, we implement all layers as AdamW
                 # For Adam blocks, we compute standard diagonal preconditioning.
                 v_block = exp_avg_sq[start_idx:end_idx]
                 P_block = (torch.sqrt(v_block) + self.adam_eps) / lr
@@ -519,6 +534,10 @@ class Muon(UpdateRule):
         t_new = t + 1.0
         exp_avg_new = exp_avg.clone()
         exp_avg_sq_new = exp_avg_sq.clone()
+        
+        # [DEBUG] Print gradient stats at first few steps
+        if t.item() < 3:
+            print(f"[update_state] Step {int(t.item())}: grad_norm={gradient.norm().item():.6f} | grad_min={gradient.min().item():.6f} | grad_max={gradient.max().item():.6f}", flush=True)
 
         for block in self.param_blocks:
             start, end = block["idx"]
@@ -540,6 +559,10 @@ class Muon(UpdateRule):
                 v_block = exp_avg_sq[start:end]
                 v_new = self.adam_beta2 * v_block + (1 - self.adam_beta2) * (g_block ** 2)
                 exp_avg_sq_new[start:end] = v_new
+                
+                # [DEBUG] Print variance stats at first few steps
+                if t.item() < 3:
+                    print(f"[update_state] Block {block['name']}: v_mean_before={v_block.mean().item():.6e} | v_mean_after={v_new.mean().item():.6e} | g_sq_mean={(g_block**2).mean().item():.6e}", flush=True)
 
         new_state = {
             "t": t_new,
@@ -563,6 +586,14 @@ class Muon(UpdateRule):
         flat_state = self.update_state(flat_state, gradient)
 
         state = self.unflatten_state(flat_state)
+
+        #! Not calling update_state, because it's already been called by the DiscreteProcess.prepare()
+        
+        # [DEBUG] Print state (every step for now to track behavior)
+        t = int(state['t'].item())
+        if t <= 20 or t % 10 == 0:  # Verbose at start, then every 10 steps
+            print(f"[Muon update] Step {t}: lr={self.lr_fn(state['t']):.6f} | exp_avg_norm={state['exp_avg'].norm().item():.4f} | exp_avg_sq_mean={state['exp_avg_sq'].mean().item():.6e}", flush=True)
+        
         exp_avg = state["exp_avg"]
 
         # 2. Build the vector to be preconditioned
@@ -583,8 +614,16 @@ class Muon(UpdateRule):
         # 3. Apply Preconditioner P^{-1}
         # .pow(-1) correctly handles the "muon_inverse" blocks by simply returning them.
         preconditioned_update = self.P(flat_state).pow(-1)(update_vector)
+        
+        # [DEBUG] Print update stats at first few steps
+        if t <= 3 or t % 10 == 0:
+            prec_norm = preconditioned_update.norm().item()
+            prec_mean = preconditioned_update.mean().item()
+            w_norm_before = w.norm().item()
+            w_norm_after = (w - preconditioned_update).norm().item()
+            print(f"[update] Step {t}: prec_update_norm={prec_norm:.6f} | prec_update_mean={prec_mean:.6e} | w_norm: {w_norm_before:.4f} → {w_norm_after:.4f}", flush=True)
 
-        # 4. Update Weights
+        # 3. Update Weights
         w = w - preconditioned_update
 
         return w, flat_state
@@ -655,6 +694,7 @@ class BlockDiagonalPreconditioner(Preconditioner):
             v_block = v[cursor:cursor+size]
             
             if block["type"] == "muon_matrix":
+                raise NotImplementedError("This block is muon_matrix, which is not yet implemented, now trying only AdamW")
                 # Apply explicit matrix multiplication: M @ v_block
                 # The matrix M is m x m. The vector v is flattened (m*n).
                 # We interpret v as (m, n) and apply M on the left: M @ V.
@@ -668,9 +708,11 @@ class BlockDiagonalPreconditioner(Preconditioner):
             elif block["type"] == "muon_inverse":
                 # We hold P^-1, but the user asked to apply P.
                 # Inverting A is unstable and unnecessary for this codebase.
-                raise NotImplementedError("Applying forward P (inverting A) is not supported for Muon blocks. Use .pow(-1) first.")
+                # raise NotImplementedError("Applying forward P (inverting A) is not supported for Muon blocks. Use .pow(-1) first.")
+                raise NotImplementedError("This block is muon_inverse, which is not yet implemented, now trying only AdamW")
                 
             else:  # diagonal
+                #! For testing purposes, the code always uses AdamW blocks
                 result_blocks.append(block["data"] * v_block)
             
             cursor += size
@@ -690,6 +732,7 @@ class BlockDiagonalPreconditioner(Preconditioner):
             new_block = block.copy()
             
             if block["type"] == "muon_inverse":
+                raise NotImplementedError("This block is muon_inverse, which is not yet implemented, now trying only AdamW")
                 # Stored data is A = P^{-1}.
                 A = block["data"]
                 
@@ -712,10 +755,12 @@ class BlockDiagonalPreconditioner(Preconditioner):
                     new_block["type"] = "muon_matrix"
 
             elif block["type"] == "muon_matrix":
-                 # Already a generic matrix M. Compute M^p.
-                 new_block["data"] = matrix_power(block["data"], power)
+                raise NotImplementedError("This block is muon_matrix, which is not yet implemented, now trying only AdamW")
+                # Already a generic matrix M. Compute M^p.
+                new_block["data"] = matrix_power(block["data"], power)
 
             else:  # diagonal
+                #! For testing purposes, the code always uses AdamW blocks
                 # (Diagonal)^p = element-wise power
                 new_block["data"] = block["data"] ** power
             
