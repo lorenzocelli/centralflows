@@ -216,10 +216,22 @@ class GradientDescent(UpdateRule):
 
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]))
+        t = state["t"]
+
+        lrs = self.lr_fn(t)
+
+        # ^ [DEBUG] Print P stats at first few steps
+        if t.item() < 3:
+            print(f"[Gradient Descent P()] Step {int(t.item())}: lr={self.lr_fn(t):.6f}", flush=True)
+            print(f"[Gradient Descent P()] P_mean={(1/lrs).mean():.6f} | P_min={(1/lrs).min():.6f} | P_max={(1/lrs).max():.6f}", flush=True)
+        return DiagonalPreconditioner(1 / lrs)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
+        t = state["t"]
+        # ^ [DEBUG] Print gradient stats at first few steps
+        if t.item() < 3:
+            print(f"[Gradient Descent update_state] Step {int(t.item())}: grad_norm={gradient.norm():.6f} | grad_min={gradient.min():.6f} | grad_max={gradient.max():.6f}", flush=True)
         state = {"t": state["t"] + 1.0}
         return flatten_pytree(state)[0]
 
@@ -371,6 +383,154 @@ class RMSProp(UpdateRule):
             "ess_harmonic_mean": ess.reciprocal().mean().reciprocal(),
             "lr": self.lr_fn(state["t"]),
         }
+
+def warmup_cosine_schedule(base_lr: float, warmup_steps: int, total_steps: int = 2000):
+    """Linear warmup + cosine decay schedule"""
+    import math
+    
+    def schedule(t):
+        if t < warmup_steps:
+            # Linear warmup
+            return base_lr * ((t + 1) / warmup_steps)
+        else:
+            # Cosine decay dopo warmup
+            progress = (t - warmup_steps) / (total_steps - warmup_steps)
+            return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+    return schedule
+
+@dataclass
+class AdamW(UpdateRule):
+    """The AdamW optimizer.
+
+    This optimizer maintains an EMA m of the gradient and an EMA ν of the elementwise squared gradient,
+    and takes gradient steps using the effective step sizes η * m / sqrt(ν).
+    Our implementation supports optional learning rate scheduling,
+    bias correction, and ε:
+
+           m_{t} = (1 - β_1) m_{t-1} + β_1 ∇L(w_t)
+           ν_{t} = (1 - β_2) ν_{t-1} + β_2 ∇L(w_t)^2
+           m̂_{t} = m_t / (1 - β_1 ^ t)
+           ν̂_{t} = ν_t / (1 - β_2 ^ t)
+           w_{t+1} = w_t - η(t) * m̂_t / (sqrt (ν̂_t) + ε)
+    The optimizer's state consists of the tuple (t, m, ν).
+    """
+
+    lr: float
+    beta1: float = 0.9
+    beta2: float = 0.999
+    bias_correction: bool = True # Just like RMSProp
+    eps: float = 1e-6 # Just like RMSProp
+    warmup_steps: int = 100
+    max_grad_norm: float = 1.0
+
+    def clip_gradient(self, gradient: Array) -> Array:
+        """Clip gradient norm for stability"""
+        grad_norm = gradient.norm()
+        if grad_norm > self.max_grad_norm:
+            gradient = gradient * (self.max_grad_norm / grad_norm)
+            print(f"[AdamW] Clipping gradient: {grad_norm:.2e} → {self.max_grad_norm}", flush=True)
+        return gradient
+
+    def __post_init__(self):
+        # self.lr_fn = to_schedule(self.lr)
+        self.lr_fn = warmup_cosine_schedule(self.lr, self.warmup_steps, total_steps=2000)
+    
+    def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+            "m": torch.zeros_like(w),
+            "v": torch.zeros_like(w),
+        }
+        flat_state, self.unflatten = flatten_pytree(state)
+        return flat_state
+
+    def P(self, flat_state: Array) -> Array:
+        # TODO could also include weight decay here
+        state = self.unflatten(flat_state)
+        t, m, v = state["t"], state["m"], state["v"]
+        if self.bias_correction:
+            # ! m_hat is not needed for the preconditioner, but will be used in update()
+            # m_hat =  (m / (1 - self.beta1**(t)))
+            v_hat = (v / (1 - self.beta2**(t)))
+        else:
+            # m_hat = m
+            v_hat = v
+        lrs = self.lr_fn(t) / (torch.sqrt(v_hat) + self.eps)
+
+        # ^ [DEBUG] Print P stats at first few steps
+        if t.item() < 3:
+            print(f"[AdamW P()] Step {int(t.item())}: lr={self.lr_fn(t):.6f} | v_mean={v.mean():.6e} | v_hat_mean={v_hat.mean():.6e}", flush=True)
+            print(f"[AdamW P()] P_mean={(1/lrs).mean():.6f} | P_min={(1/lrs).min():.6f} | P_max={(1/lrs).max():.6f}", flush=True)
+        return DiagonalPreconditioner(1 / lrs)
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        state = self.unflatten(flat_state)
+        t, m, v = state["t"], state["m"], state["v"]
+
+        # ^ [DEBUG] Print gradient stats at first few steps
+        if t.item() < 3:
+            print(f"[AdamW update_state] Step {int(t.item())}: grad_norm={gradient.norm():.6f} | grad_min={gradient.min():.6f} | grad_max={gradient.max():.6f}", flush=True)
+
+        # ^ Update m and v
+        m_new = m * self.beta1 + gradient * (1 - self.beta1)
+        v_new = v * self.beta2 + gradient**2 * (1 - self.beta2)
+
+        # ^ [DEBUG] Print state changes at first few steps
+        if t.item() < 3:
+            print(f"[AdamW update_state] m: {m.norm():.6e} → {m_new.norm():.6e} | v: {v.mean():.6e} → {v_new.mean():.6e}", flush=True)
+
+        state = {"t": t + 1.0, "m": m_new, "v": v_new}
+        return flatten_pytree(state)[0]
+
+    def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
+        """
+            Custom update for AdamW: need to apply the preconditioner to MOMENTUM, not gradient
+        """
+        # Get state
+        # ! Here we do not call update_state, it's already been called by the DiscreteProcess
+        state = self.unflatten(flat_state)
+                
+        t, m = state["t"], state["m"]
+
+        if self.bias_correction:
+            m_hat =  (m / (1 - self.beta1**(t)))
+
+            # ^ [DEBUG] Print bias correction effect at first few steps
+            if t.item() <= 3:
+                print(f"[AdamW update] Bias correction: factor={(1 - self.beta1**(t)):.6f} | m_norm={m.norm():.6e} | m_hat_norm={m_hat.norm():.6e}", flush=True)
+        else:
+            m_hat = m
+
+        preconditioned_update = self.P(flat_state).pow(-1)(m_hat)
+
+        # ^ [DEBUG] Print update stats
+        if t.item() <= 3 or t.item() % 10 == 0:
+            w_norm_before = w.norm().item()
+            w_norm_after = (w - preconditioned_update).norm().item()
+            print(f"[AdamW update] Step {int(t.item())}: prec_update_norm={preconditioned_update.norm():.6f} | w_norm: {w_norm_before:.4f} → {w_norm_after:.4f}", flush=True)
+
+        # Apply preconditioner now to MOMENTUM
+        w = w - preconditioned_update
+        return w, flat_state
+
+    def dstate_dt(self, flat_state: Array, gradient: Array) -> Array:
+        update = self.update_state(flat_state, gradient) - flat_state
+        return update / self.beta2
+
+    def summarize_state(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        v = state["v"]
+        ess = self.P(flat_state).pow(-1)(torch.ones_like(v))
+        selected_idx = np.linspace(0, len(v) - 1, 25, dtype=int)
+        return {
+            "t": state["t"],
+            "v_l1": v.sum(),                  
+            "v_selected_idx": v[selected_idx],
+            "ess_mean": ess.mean(),             
+            "ess_harmonic_mean": ess.reciprocal().mean().reciprocal(),
+            "lr": self.lr_fn(state["t"]),
+        }
+
 
 @dataclass
 class Muon(UpdateRule):

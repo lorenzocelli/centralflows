@@ -141,6 +141,10 @@ class DiscreteProcess(Process):
 
             self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)
 
+            # 🔥 AGGIUNGI GRADIENT CLIPPING QUI
+            if hasattr(self.opt, 'clip_gradient'):
+                self.gradient = self.opt.clip_gradient(self.gradient)
+
             self.state = self.opt.update_state(self.state, self.gradient)
 
             P = self.opt.P(self.state)
@@ -183,7 +187,7 @@ class MidpointProcess(Process):
         # self.w = w_t, self.w_prev = w_{t-1}
         timer = Timer()
         with timer("grad_and_value"):
-            self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)
+            self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)            
             self.state = self.opt.update_state(self.state, self.gradient)
         P = self.opt.P(self.state)
         self.w_next = self.w - P.pow(-1)(self.gradient)  # self.w_next = w_{t+1}
