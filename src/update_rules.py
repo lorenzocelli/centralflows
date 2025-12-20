@@ -384,8 +384,8 @@ class RMSProp(UpdateRule):
             "lr": self.lr_fn(state["t"]),
         }
 
-def warmup_cosine_schedule(base_lr: float, warmup_steps: int, total_steps: int = 2000):
-    """Linear warmup + cosine decay schedule"""
+def warmup_cosine_schedule(base_lr: float, warmup_steps: int, total_steps: int = 2000, min_lr_ratio: float = 0.1):
+    """Linear warmup + cosine decay con minimum LR"""
     import math
     
     def schedule(t):
@@ -393,9 +393,11 @@ def warmup_cosine_schedule(base_lr: float, warmup_steps: int, total_steps: int =
             # Linear warmup
             return base_lr * ((t + 1) / warmup_steps)
         else:
-            # Cosine decay dopo warmup
+            # Cosine decay fino a min_lr_ratio * base_lr
             progress = (t - warmup_steps) / (total_steps - warmup_steps)
-            return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            # Invece di decadere a 0, decadi a min_lr_ratio * base_lr
+            return base_lr * (min_lr_ratio + (1 - min_lr_ratio) * cosine_factor)
     return schedule
 
 @dataclass
@@ -433,7 +435,7 @@ class AdamW(UpdateRule):
 
     def __post_init__(self):
         # self.lr_fn = to_schedule(self.lr)
-        self.lr_fn = warmup_cosine_schedule(self.lr, self.warmup_steps, total_steps=2000)
+        self.lr_fn = warmup_cosine_schedule(self.lr, self.warmup_steps, total_steps=2000, min_lr_ratio=0.1)
     
     def initialize_state(self, w: Array, unflatten: Any = None) -> Array:
         state = {
