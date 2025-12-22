@@ -30,7 +30,7 @@ from src.processes import (
     EigConfig
 )
 from src.saving import Checkpointer, DataSaver, LoadOptions
-from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp
+from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp, CompositeUpdateRule
 from src.utils import convert_dataclasses
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -43,6 +43,7 @@ ValidOpt = Union[
     Annotated[GradientDescent, subcommand("gd")],
     Annotated[ScalarRMSProp, subcommand("scalar_rmsprop")],
     Annotated[RMSProp, subcommand("rmsprop")],
+    Annotated[CompositeUpdateRule, subcommand("comp")],
 ]
 ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification]#, FlattenedMNIST, SparseParity]
 ValidArch = Union[CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet]
@@ -101,7 +102,7 @@ def main(
     w, model_fn = FunctionalModel.make_functional(model)
     
     # initialize optimizer state
-    state = opt.initialize_state(w) 
+    state = opt.initialize_state(w, model_fn.unflatten) 
     
     # put together loss function
     loss_fn = SupervisedLossFunction(

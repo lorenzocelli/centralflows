@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
+import re
 
 from .utils import flatten_pytree
 
@@ -26,11 +27,12 @@ class UpdateRule:
     The functional design here is inspired by Jax's Optax library.
     """
         
-    def initialize_state(self, w: torch.Tensor) -> Array:
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         """Initialize the state.
         
         Args:
           w: the initial weights
+          unflatten_w (callable): function to unflatten weights
           
         Returns:
           Array: the state, as a flat vector (see subclasses for examples)
@@ -105,14 +107,17 @@ class GradientDescent(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
-        state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+        }
         flat_state, self.unflatten = flatten_pytree(state)
+        self.n = w.shape[0]
         return flat_state
 
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]))
+        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]), self.n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -169,12 +174,13 @@ class ScalarRMSProp(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "nu": torch.tensor(0.0, dtype=w.dtype, device=w.device),
         }
         flat_state, self.unflatten = flatten_pytree(state)
+        self.n = w.shape[0]
         return flat_state
 
     def P(self, flat_state: Array) -> Array:
@@ -185,7 +191,7 @@ class ScalarRMSProp(UpdateRule):
         else:
             nu_hat = nu
         lrs = self.lr_fn(t) / (torch.sqrt(nu_hat) + self.eps)
-        return DiagonalPreconditioner(1 / lrs)
+        return DiagonalPreconditioner(1 / lrs, self.n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -251,7 +257,7 @@ class RMSProp(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "nu": torch.zeros_like(w),
@@ -267,7 +273,7 @@ class RMSProp(UpdateRule):
         else:
             nu_hat = nu
         lrs = self.lr_fn(t) / (torch.sqrt(nu_hat) + self.eps)
-        return DiagonalPreconditioner(1 / lrs)
+        return DiagonalPreconditioner(1 / lrs, nu.shape[0])
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -296,6 +302,93 @@ class RMSProp(UpdateRule):
         }
 
 
+@dataclass
+class OptimizerSelector:
+    """Generic class for selecting optimizers for different layers."""
+
+    def get_optimizer(self, layer_name: str):
+        """Return the appropriate optimizer for the given layer."""
+        raise NotImplementedError()
+
+
+@dataclass
+class RegexOptimizerSelector(OptimizerSelector):
+    """Select optimizers based on whether the layer name matches a regex pattern."""
+
+    matching_factory: callable[UpdateRule]
+    non_matching_factory: callable[UpdateRule]
+    pattern: str
+
+    def get_optimizer(self, layer_name: str) -> UpdateRule:
+        if re.search(self.pattern, layer_name):
+            return self.matching_factory()
+        return self.non_matching_factory()
+
+
+@dataclass
+class CompositeUpdateRule(UpdateRule):
+    """An update rule that applies different optimizers to different parameter groups."""
+
+    @dataclass
+    class UpdateRuleGroup:
+        """Utility class for grouping an optimizer with the parameter span it applies to."""
+
+        layer_name: str
+        span: Tuple[int, int]
+        optimizer: UpdateRule
+
+    def __post_init__(self):
+        self.groups = []
+        self.selector: OptimizerSelector = RegexOptimizerSelector(
+            matching_factory=lambda: GradientDescent(lr=0.01),
+            non_matching_factory=lambda: RMSProp(lr=2e-5, beta2=0.99),
+            pattern="(*).bias",
+        )
+
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
+        indices = torch.arange(w.shape[0])
+        tree_w = unflatten_w(w)
+        tree_ix = unflatten_w(torch.tensor(indices))
+
+        for layer_name in tree_w.keys():
+            optimizer = self.selector.get_optimizer(layer_name)
+            indices = tree_ix[layer_name]
+            span = (indices.min().item(), indices.max().item() + 1)
+            self.groups.append(
+                CompositeUpdateRule.UpdateRuleGroup(layer_name, span, optimizer)
+            )
+
+        self.groups.sort(key=lambda g: g.span[0])
+
+        state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
+        for group in self.groups:
+            w_slice = w[group.span[0] : group.span[1]]
+            state[group.layer_name] = group.optimizer.initialize_state(w_slice)
+
+        flat_state, self.unflatten = flatten_pytree(state)
+        return flat_state
+
+    def P(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        return BlockDiagonalPreconditioner(
+            [group.optimizer.P(state[group.layer_name]) for group in self.groups]
+        )
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        state = self.unflatten(flat_state)
+        state["t"] += 1.0
+        for group in self.groups:
+            grad_slice = gradient[group.span[0] : group.span[1]]
+            state[group.layer_name] = group.optimizer.update_state(
+                state[group.layer_name], grad_slice
+            )
+        return flatten_pytree(state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        return {"t": state["t"]}
+
+
 class Preconditioner:
     """Abstract class for a preconditioner."""
     
@@ -321,23 +414,63 @@ class Preconditioner:
         """
         raise NotImplementedError()
 
+    def size(self) -> int:
+        """Return the size of the preconditioner."""
+        raise NotImplementedError()
+
 
 class DiagonalPreconditioner(Preconditioner):
     """A diagonal (i.e. elementwise) preconditioner."""
     
-    def __init__(self, P):
+    def __init__(self, P, n: int):
         """Constructor for the diagonal preconditioner.
+        Note: the size is a required argument since P may be a 
+        scalar, in which case its size cannot be inferred.
         
         Args:
           P (Array): the diagonal preconditioner, as a vector
+          n (int): the size of the preconditioner
         """
+        if isinstance(P, torch.Tensor) and P.isinf().any():
+            raise ValueError("Preconditioner contains infinite values.")
+        self.n = n
         self.P = P
 
     def __call__(self, v: Array) -> Array:
         return v * self.P
 
     def pow(self, power: float) -> DiagonalPreconditioner:
-        return DiagonalPreconditioner(self.P**power)
+        return DiagonalPreconditioner(self.P**power, self.n)
+
+    def size(self) -> int:
+        return self.n
+
+
+class BlockDiagonalPreconditioner(Preconditioner):
+    """A block-diagonal preconditioner."""
+
+    def __init__(self, blocks: list[Preconditioner]):
+        """Constructor for the block diagonal preconditioner.
+
+        Args:
+          blocks (list[Preconditioner]): the diagonal blocks of the preconditioner
+        """
+        self.blocks = blocks
+
+    def __call__(self, v: Array) -> Array:
+        offset = 0
+        result = torch.zeros_like(v)
+        for block in self.blocks:
+            block_size = block.size()
+            result[offset : offset + block_size] = block(
+                v[offset : offset + block_size]
+            )
+            offset += block_size
+        return result
+
+    def pow(self, power: float) -> BlockDiagonalPreconditioner:
+        new_blocks = [block.pow(power) for block in self.blocks]
+        return BlockDiagonalPreconditioner(new_blocks)
 
 
 def to_schedule(schedule_or_constant):
