@@ -342,7 +342,7 @@ class CompositeUpdateRule(UpdateRule):
         self.selector: OptimizerSelector = RegexOptimizerSelector(
             matching_factory=lambda: GradientDescent(lr=0.01),
             non_matching_factory=lambda: RMSProp(lr=2e-5, beta2=0.99),
-            pattern="(*).bias",
+            pattern=".*bias",
         )
 
     def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
