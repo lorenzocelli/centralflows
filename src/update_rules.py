@@ -363,7 +363,7 @@ class CompositeUpdateRule(UpdateRule):
         state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
         for group in self.groups:
             w_slice = w[group.span[0] : group.span[1]]
-            state[group.layer_name] = group.optimizer.initialize_state(w_slice)
+            state[group.layer_name] = group.optimizer.initialize_state(w_slice, unflatten_w)
 
         flat_state, self.unflatten = flatten_pytree(state)
         return flat_state
