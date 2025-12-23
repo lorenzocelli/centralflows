@@ -334,7 +334,7 @@ class RMSProp(UpdateRule):
     The optimizer's state consists of the tuple (t, ν).
     """
     lr: float
-    beta2: float
+    beta2: float = 0.99
     eps: float = 0
     bias_correction: bool = False
 
@@ -420,8 +420,8 @@ class AdamW(UpdateRule):
     lr: float
     beta1: float = 0.9
     beta2: float = 0.999
-    bias_correction: bool = True # Just like RMSProp
-    eps: float = 1e-6 # Just like RMSProp
+    bias_correction: bool = False
+    eps: float = 1e-3
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
 
@@ -442,6 +442,7 @@ class AdamW(UpdateRule):
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "m": torch.zeros_like(w),
             "v": torch.zeros_like(w),
+            #"v": torch.full_like(w, 1e-4)
         }
         flat_state, self.unflatten = flatten_pytree(state)
         return flat_state

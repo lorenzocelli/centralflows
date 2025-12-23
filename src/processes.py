@@ -141,9 +141,9 @@ class DiscreteProcess(Process):
 
             self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)
 
-            # 🔥 AGGIUNGI GRADIENT CLIPPING QUI
+            """# 🔥 AGGIUNGI GRADIENT CLIPPING QUI
             if hasattr(self.opt, 'clip_gradient'):
-                self.gradient = self.opt.clip_gradient(self.gradient)
+                self.gradient = self.opt.clip_gradient(self.gradient)"""
 
             self.state = self.opt.update_state(self.state, self.gradient)
 

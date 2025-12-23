@@ -20,4 +20,5 @@ source .venv/bin/activate
 # Test GPU availability
 # python test_cuda.py
 
-python main.py opt:adamw data:cifar10 arch:mlp --expid=adamw --data.classes=4 --data.n=1000 --data.criterion=mse --opt.lr=0.01 --runs discrete --steps=2000 --eig.frequency=1 --eig.track-threshold=None
+python main.py opt:adamw data:cifar10 arch:mlp --expid=adamw_fix_2 --data.classes=4 --data.n=1000 --data.criterion=mse --opt.lr=0.001 --runs discrete --steps=2000 --eig.frequency=1 --eig.track-threshold=None
+# python main.py opt:rmsprop data:cifar10 arch:mlp --expid=rmsprop --data.classes=4 --data.n=1000 --data.criterion=mse --opt.lr=2e-5 --opt.beta2=0.99 --opt.eps=1e-7 --opt.bias-correction --runs discrete --steps=500 --eig.frequency=1 --warm-start 5 --eig.track-threshold 1.75
