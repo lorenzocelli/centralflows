@@ -302,41 +302,83 @@ class RMSProp(UpdateRule):
         }
 
 
-def preconditioner_ns(G: Array, steps: int) -> Array:
+def preconditioner_ns(G: Array, steps: int) -> Tuple[Array, Array]:
     """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
+    Performs the Newton-Schulz iteration to compute the Muon update and the explicit
+    preconditioner matrix.
+
+    DESIGN CHOICE: "Parallel Identity" Algorithm
+    --------------------------------------------
+    Standard Muon only computes the update X_K = P^{-1} G_0. However, to analyze eigenvalues
+    of P^{-1}H, we need the explicit operator P^{-1}.
+    This function runs a parallel iteration on an accumulator matrix A (initialized to Identity)
+    applying the same transformations B(X_k) to A that are applied to X.
+    By linearity, if X_{k+1} = B(X_k) X_k, then A_{final} satisfies X_{final} = A_{final} G_0.
+    Thus, A_final is the explicit matrix form of P^{-1}.
+
+    Mathematical Notation (from Proposal):
+    - Input G is the gradient block G_0 (or momentum).
+    - X tracks the iterates X_k, converging to the orthogonalized update.
+    - A tracks the preconditioner P_{Muon}^{-1}(G_0).
+    - The polynomial update is B(X) = alpha*I + beta*XX^T + gamma*(XX^T)^2.
+
+    Args:
+        G (Tensor): The input matrix G_0 (usually momentum).
+        steps (int): Number of Newton-Schulz steps (usually 5).
+
+    Returns:
+        X (Tensor): The final update step X_K approx P^{-1} G_0.
+        A (Tensor): The explicit left-preconditioner matrix P_{Muon}^{-1}(G_0).
     """
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
-    # X = G.bfloat16()
-    X = G.clone()
-    if G.size(-2) > G.size(-1):
-        raise NotImplementedError("preconditioner_ns does not support tall matrices yet.")
-        X = X.mT
+    assert G.ndim == 2
+    m, n = G.shape
 
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps - 1):
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    
-    # Final iteration, isolate the preconditioner
-    A = X @ X.mT
-    B = b * A + c * A @ A
-    X = a + B
-    
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    # 1. Normalization
+    # We define the scaling factor c = ||G_0||_F + epsilon.
+    # To ensure stability, inputs to Newton-Schulz must have spectral norm < 1.
+    norm = G.norm(dim=(-2, -1), keepdim=True) + 1e-7
 
-    return X
+    # Initialize iterates.
+    # We delay the final Muon scaling factor (sqrt(m/n)) until the end to avoid
+    # exploding values during the iteration if m >> n.
+    # X_0 = (1/c) * G_0
+    X = G / norm
+
+    # Initialize the accumulator A.
+    # Since X_0 = (1/c) * I * G_0, the operator starts as A_0 = (1/c) * I.
+    A = torch.eye(m, dtype=G.dtype, device=G.device) / norm
+
+    # Quintic coefficients for the polynomial B(X).
+    # These correspond to alpha, beta, gamma in the proposal's update rule.
+    a, b, c = (3.4445, -4.7750, 2.0315)
+
+    # 2. Iteration
+    for _ in range(steps):
+        # Compute X_k * X_k^T
+        XXt = X @ X.mT
+
+        # Compute the polynomial B(X_k) = alpha*I + beta*XX^T + gamma*(XX^T)^2
+        # This operator is symmetric and depends only on the singular values of X_k.
+        B = a * torch.eye(m, device=G.device, dtype=G.dtype) + b * XXt + c * (XXt @ XXt)
+
+        # Update X: X_{k+1} = B(X_k) @ X_k
+        X = B @ X
+
+        # Update A: A_{k+1} = B(X_k) @ A_k
+        # We apply the exact same left-operator B(X_k) to A.
+        # This preserves the invariant X_k = A_k @ G_0.
+        A = B @ A
+
+    # 3. Muon Scaling
+    # The proposal defines the final update as scaled by sqrt(max(1, m/n)).
+    # We apply this scalar factor to both the update X and the operator A
+    # so that X = A @ G_0 still holds.
+    if m > n:
+        scale = (m / n) ** 0.5
+        X = X * scale
+        A = A * scale
+
+    return X, A
 
 
 @dataclass
@@ -363,7 +405,7 @@ class Muon(UpdateRule):
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
         _, momentum = state["t"], state["momentum"]
-        p = preconditioner_ns(momentum, steps=self.ns_steps)
+        _, p = preconditioner_ns(momentum, steps=self.ns_steps)
         p *= self.lr * max(1, momentum.size(-2) / momentum.size(-1)) ** 0.5
         n = max(momentum.size(-2), momentum.size(-1))
         return BlockDiagonalPreconditioner(
