@@ -5,7 +5,7 @@ from typing import Any, Dict, Union, Callable, TypeVar
 
 import numpy as np
 import torch
-from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils._pytree import tree_flatten, tree_unflatten, tree_is_leaf
 import math
 
 Array = Any
@@ -56,19 +56,41 @@ def load_pytree(path, map_location=None):
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
     return tree_unflatten(checkpoint['flat'], checkpoint['spec'])
 
-def flatten_pytree(pytree):
+def recursive_mtranspose(pytree):
+    """
+    Return a shallow copy of the pytree where all tensors that
+    have at least 2 dimensions are transposed (see Tensor.mT).
+
+    Args:
+        pytree: A pytree (e.g. hierarchical dict) of tensors
+
+    Returns:
+        pytree: The resulting pytree with transposed tensors
+    """
+    if tree_is_leaf(pytree):
+        if isinstance(pytree, torch.Tensor) and pytree.ndim >= 2:
+            return pytree.mT
+        return pytree
+
+    return {k: recursive_mtranspose(v) for k, v in pytree.items()}
+
+def flatten_pytree(pytree, colwise: bool = True):
     """Flatten a pytree of tensors into one tensor.
-    
+
     Args:
       pytree: a pytree (e.g. a hierarchical dict) of tensors
-    
+      colwise: whether to flatten in column-wise order.
+
     Returns:
       Array: a single flat tensor that contains that concatenation
         of all the pytree leaf tensors
       Function: an unflattening function that turns such flat tensors
         back into pytrees
-    
+
     """
+    if colwise:
+        pytree = recursive_mtranspose(pytree)
+
     listp, treedef = tree_flatten(pytree)
     flatp = torch.concatenate([p.ravel() for p in listp])
     sizes, shapes = zip(*[(x.numel(), x.shape) for x in listp])
@@ -76,7 +98,8 @@ def flatten_pytree(pytree):
     def unflatten(flatp):
         chunks = flatp.split(sizes)
         listp = [chunk.reshape(shape) for chunk, shape in zip(chunks, shapes)]
-        return tree_unflatten(listp, treedef)
+        pytree = tree_unflatten(listp, treedef)
+        return recursive_mtranspose(pytree) if colwise else pytree
 
     return flatp, unflatten
 
