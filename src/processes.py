@@ -515,7 +515,9 @@ class EigManager:
         )
         
     def get(self, w: Array, P: Optional[Preconditioner] = None):
-        P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
+        if self.config.frequency > 0:
+            # Only compute the square root when we need it
+            P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
 
         # if frequency == -1, never compute the eigenpairs
         if self.config.frequency <= 0:
