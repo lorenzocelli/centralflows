@@ -302,6 +302,99 @@ class RMSProp(UpdateRule):
         }
 
 
+def preconditioner_ns(G: Array, steps: int) -> Array:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    # X = G.bfloat16()
+    X = G.clone()
+    if G.size(-2) > G.size(-1):
+        raise NotImplementedError("preconditioner_ns does not support tall matrices yet.")
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps - 1):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    
+    # Final iteration, isolate the preconditioner
+    A = X @ X.mT
+    B = b * A + c * A @ A
+    X = a + B
+    
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    return X
+
+
+@dataclass
+class Muon(UpdateRule):
+    """TODO"""
+
+    lr: float = 0.02
+    beta: float = 0.95
+    ns_steps: int = 5
+    nesterov: bool = False
+
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
+        self.unflatten_w = unflatten_w
+        matrix_w = unflatten_w(w)
+        assert matrix_w.ndim >= 2
+
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+            "momentum": torch.zeros_like(matrix_w),
+        }
+        flat_state, self.unflatten = flatten_pytree(state)
+        return flat_state
+
+    def P(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        _, momentum = state["t"], state["momentum"]
+        p = preconditioner_ns(momentum, steps=self.ns_steps)
+        p *= self.lr * max(1, momentum.size(-2) / momentum.size(-1)) ** 0.5
+        n = max(momentum.size(-2), momentum.size(-1))
+        return BlockDiagonalPreconditioner(
+            # TODO: we might not need to copy
+            # TODO: we should have a special BlockDiagonalPreconditioner for this case with identical blocks
+            [GenericPreconditioner(p.clone()) for _ in range(n)]
+        )
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        state = self.unflatten(flat_state)
+        gradient = self.unflatten_w(gradient)
+
+        t, momentum = state["t"], state["momentum"]
+
+        momentum = momentum.lerp(gradient, 1 - self.beta)
+        momentum = gradient.lerp(momentum, self.beta) if self.nesterov else momentum
+
+        if momentum.ndim == 4:  # for the case of conv filters
+            raise NotImplementedError(
+                "Muon optimizer does not support dim > 2 yet."
+            )
+            momentum = momentum.view(len(momentum), -1)
+
+        state = {"t": t + 1.0, "momentum": momentum}
+        return flatten_pytree(state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Array:
+        # TODO
+        return {}
+
+
 @dataclass
 class OptimizerSelector:
     """Generic class for selecting optimizers for different layers."""
@@ -340,8 +433,8 @@ class CompositeUpdateRule(UpdateRule):
     def __post_init__(self):
         self.groups = []
         self.selector: OptimizerSelector = RegexOptimizerSelector(
-            matching_factory=lambda: GradientDescent(lr=0.01),
-            non_matching_factory=lambda: RMSProp(lr=2e-5, beta2=0.99),
+            matching_factory=lambda: RMSProp(lr=2e-5, beta2=0.99),
+            non_matching_factory=lambda: Muon(lr=0.02, beta=0.95, ns_steps=5),
             pattern=".*bias",
         )
 
@@ -363,7 +456,8 @@ class CompositeUpdateRule(UpdateRule):
         state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
         for group in self.groups:
             w_slice = w[group.span[0] : group.span[1]]
-            state[group.layer_name] = group.optimizer.initialize_state(w_slice, unflatten_w)
+            _, unflatten_w_slice = flatten_pytree(tree_w[group.layer_name])
+            state[group.layer_name] = group.optimizer.initialize_state(w_slice, unflatten_w_slice)
 
         flat_state, self.unflatten = flatten_pytree(state)
         return flat_state
@@ -414,6 +508,33 @@ class Preconditioner:
     def size(self) -> int:
         """Return the size of the preconditioner."""
         raise NotImplementedError()
+
+
+class GenericPreconditioner(Preconditioner):
+    """A generic preconditioner represented as a matrix."""
+
+    def __init__(self, P: Array):
+        """Constructor for the generic preconditioner.
+
+        Args:
+          P (Array): the preconditioner, as a matrix
+        """
+        if P.ndim != 2 or P.shape[0] != P.shape[1]:
+            raise ValueError("Preconditioner must be a square matrix.")
+
+        self.P = P
+
+    def __call__(self, v: Array) -> Array:
+        return self.P @ v
+
+    def sqrt(self) -> GenericPreconditioner:
+        # TODO: ensure the matrix is symmetric psd
+        U, S, V = torch.linalg.svd(self.P)
+        P_sqrt = U @ torch.diag(torch.sqrt(S)) @ V
+        return GenericPreconditioner(P_sqrt)
+
+    def size(self) -> int:
+        return self.P.shape[0]
 
 
 class DiagonalPreconditioner(Preconditioner):
@@ -468,6 +589,9 @@ class BlockDiagonalPreconditioner(Preconditioner):
     def sqrt(self) -> BlockDiagonalPreconditioner:
         new_blocks = [block.sqrt() for block in self.blocks]
         return BlockDiagonalPreconditioner(new_blocks)
+
+    def size(self) -> int:
+        return sum(block.size() for block in self.blocks)
 
 
 def to_schedule(schedule_or_constant):
