@@ -88,7 +88,7 @@ class UpdateRule:
     def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
         """Update both the weights and optimizer state."""
         flat_state = self.update_state(flat_state, gradient)
-        w = w - self.P(flat_state).pow(-1)(gradient)
+        w = w - self.P(flat_state)(gradient)
         return w, flat_state
 
 
@@ -117,7 +117,7 @@ class GradientDescent(UpdateRule):
 
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]), self.n)
+        return DiagonalPreconditioner(self.lr_fn(state["t"]), self.n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -191,7 +191,7 @@ class ScalarRMSProp(UpdateRule):
         else:
             nu_hat = nu
         lrs = self.lr_fn(t) / (torch.sqrt(nu_hat) + self.eps)
-        return DiagonalPreconditioner(1 / lrs, self.n)
+        return DiagonalPreconditioner(lrs, self.n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -273,7 +273,7 @@ class RMSProp(UpdateRule):
         else:
             nu_hat = nu
         lrs = self.lr_fn(t) / (torch.sqrt(nu_hat) + self.eps)
-        return DiagonalPreconditioner(1 / lrs, nu.shape[0])
+        return DiagonalPreconditioner(lrs, nu.shape[0])
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -403,11 +403,8 @@ class Preconditioner:
         """
         raise NotImplementedError()
     
-    def pow(self, p: float) -> Preconditioner:
-        """Return a new preconditioner which is this preconditioner raised to a power.
-        
-        Args:
-          p: the power
+    def sqrt(self) -> Preconditioner:
+        """Return a new preconditioner which is the square root of this preconditioner.
         
         Returns:
           (Preconditioner): a new preconditioner
@@ -439,8 +436,8 @@ class DiagonalPreconditioner(Preconditioner):
     def __call__(self, v: Array) -> Array:
         return v * self.P
 
-    def pow(self, power: float) -> DiagonalPreconditioner:
-        return DiagonalPreconditioner(self.P**power, self.n)
+    def sqrt(self) -> DiagonalPreconditioner:
+        return DiagonalPreconditioner(self.P**0.5, self.n)
 
     def size(self) -> int:
         return self.n
@@ -468,8 +465,8 @@ class BlockDiagonalPreconditioner(Preconditioner):
             offset += block_size
         return result
 
-    def pow(self, power: float) -> BlockDiagonalPreconditioner:
-        new_blocks = [block.pow(power) for block in self.blocks]
+    def sqrt(self) -> BlockDiagonalPreconditioner:
+        new_blocks = [block.sqrt() for block in self.blocks]
         return BlockDiagonalPreconditioner(new_blocks)
 
 

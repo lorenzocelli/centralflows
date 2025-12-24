@@ -148,7 +148,7 @@ class DiscreteProcess(Process):
 
     def step(self):
         P = self.opt.P(self.state)
-        self.w -= P.pow(-1)(self.gradient)
+        self.w -= P(self.gradient)
 
 
 @dataclass
@@ -183,7 +183,7 @@ class MidpointProcess(Process):
             self.gradient, self.loss = self.loss_fn.grad_and_value(self.w)
             self.state = self.opt.update_state(self.state, self.gradient)
         P = self.opt.P(self.state)
-        self.w_next = self.w - P.pow(-1)(self.gradient)  # self.w_next = w_{t+1}
+        self.w_next = self.w - P(self.gradient)  # self.w_next = w_{t+1}
         w_curr = self.w  # w_curr = w_t
         if self.w_prev is not None:
             # set self.w to the midpoint of midpoints w^\star_t
@@ -515,7 +515,7 @@ class EigManager:
         )
         
     def get(self, w: Array, P: Optional[Preconditioner] = None):
-        P_inv_sqrt = (lambda x: x) if P is None else P.pow(-1 / 2)
+        P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
 
         # if frequency == -1, never compute the eigenpairs
         if self.config.frequency <= 0:
