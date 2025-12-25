@@ -408,11 +408,7 @@ class Muon(UpdateRule):
         _, p = preconditioner_ns(momentum, steps=self.ns_steps)
         p *= self.lr * max(1, momentum.size(-2) / momentum.size(-1)) ** 0.5
         n = max(momentum.size(-2), momentum.size(-1))
-        return BlockDiagonalPreconditioner(
-            # TODO: we might not need to copy
-            # TODO: we should have a special BlockDiagonalPreconditioner for this case with identical blocks
-            [GenericPreconditioner(p.clone()) for _ in range(n)]
-        )
+        return SingleBlockDiagonalPreconditioner(GenericPreconditioner(p), n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -475,8 +471,8 @@ class CompositeUpdateRule(UpdateRule):
     def __post_init__(self):
         self.groups = []
         self.selector: OptimizerSelector = RegexOptimizerSelector(
-            matching_factory=lambda: RMSProp(lr=2e-5, beta2=0.99),
-            non_matching_factory=lambda: Muon(lr=0.02, beta=0.95, ns_steps=5),
+            matching_factory=lambda: GradientDescent(lr=100000), # TODO: bias layers are disabled for now
+            non_matching_factory=lambda: Muon(lr=0.0001, beta=0.95, ns_steps=5),
             pattern=".*bias",
         )
 
@@ -570,10 +566,12 @@ class GenericPreconditioner(Preconditioner):
         return self.P @ v
 
     def sqrt(self) -> GenericPreconditioner:
-        # TODO: ensure the matrix is symmetric psd
-        U, S, V = torch.linalg.svd(self.P)
-        P_sqrt = U @ torch.diag(torch.sqrt(S)) @ V
-        return GenericPreconditioner(P_sqrt)
+        # Compute sqrt with eigendecomposition
+        eigenvalues, eigenvectors = torch.linalg.eigh(self.P)
+        eigenvalues = torch.clamp(eigenvalues, 0)
+        root_eigenvalues = torch.sqrt(eigenvalues)
+        sqrt = eigenvectors @ (root_eigenvalues[:, None] * eigenvectors.T)
+        return GenericPreconditioner(sqrt)
 
     def size(self) -> int:
         return self.P.shape[0]
@@ -634,6 +632,34 @@ class BlockDiagonalPreconditioner(Preconditioner):
 
     def size(self) -> int:
         return sum(block.size() for block in self.blocks)
+
+
+class SingleBlockDiagonalPreconditioner(Preconditioner):
+    def __init__(self, block: Preconditioner, n: int):
+        """
+        Initialize a block diagonal preconditioner with a 
+        single block repeated along the diagonal.
+        
+        Args:
+          block (Preconditioner): the block to repeat
+          n (int): the number of times to repeat the block
+        """
+        self.block = block
+        self.n = n
+    
+    def __call__(self, v: Array) -> Array:
+        result = torch.zeros_like(v)
+        for i in range(self.n):
+            start = i * self.block.size()
+            end = start + self.block.size()
+            result[start:end] = self.block(v[start:end])
+        return result
+
+    def sqrt(self) -> SingleBlockDiagonalPreconditioner:
+        return SingleBlockDiagonalPreconditioner(self.block.sqrt(), self.n)
+    
+    def size(self) -> int:
+        return self.n * self.block.size()
 
 
 def to_schedule(schedule_or_constant):
