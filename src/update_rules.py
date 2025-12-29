@@ -388,7 +388,6 @@ class Muon(UpdateRule):
     lr: float = 0.02
     beta: float = 0.95
     ns_steps: int = 5
-    nesterov: bool = False
 
     def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         self.unflatten_w = unflatten_w
@@ -397,35 +396,30 @@ class Muon(UpdateRule):
 
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
-            "momentum": torch.zeros_like(matrix_w),
+            "gradient": torch.zeros_like(matrix_w),
         }
         flat_state, self.unflatten = flatten_pytree(state)
         return flat_state
 
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        _, momentum = state["t"], state["momentum"]
-        _, p = preconditioner_ns(momentum, steps=self.ns_steps)
-        p *= self.lr * max(1, momentum.size(-2) / momentum.size(-1)) ** 0.5
-        n = max(momentum.size(-2), momentum.size(-1))
+        gradient = state["gradient"]
+        _, p = preconditioner_ns(gradient, steps=self.ns_steps)
+        p *= self.lr * max(1, gradient.size(-2) / gradient.size(-1)) ** 0.5
+        n = max(gradient.size(-2), gradient.size(-1))
         return SingleBlockDiagonalPreconditioner(GenericPreconditioner(p), n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
         gradient = self.unflatten_w(gradient)
 
-        t, momentum = state["t"], state["momentum"]
-
-        momentum = momentum.lerp(gradient, 1 - self.beta)
-        momentum = gradient.lerp(momentum, self.beta) if self.nesterov else momentum
-
-        if momentum.ndim == 4:  # for the case of conv filters
+        if gradient.ndim == 4:  # for the case of conv filters
             raise NotImplementedError(
                 "Muon optimizer does not support dim > 2 yet."
             )
-            momentum = momentum.view(len(momentum), -1)
+            gradient = gradient.view(len(gradient), -1)
 
-        state = {"t": t + 1.0, "momentum": momentum}
+        state = {"t": state["t"] + 1.0, "gradient": gradient}
         return flatten_pytree(state)[0]
 
     def summarize_state(self, flat_state: Array) -> Array:
