@@ -405,7 +405,7 @@ class Muon(UpdateRule):
         state = self.unflatten(flat_state)
         gradient = state["gradient"]
         _, p = preconditioner_ns(gradient, steps=self.ns_steps)
-        p *= self.lr * max(1, gradient.size(-2) / gradient.size(-1)) ** 0.5
+        p.mul_(self.lr)
         n = max(gradient.size(-2), gradient.size(-1))
         return SingleBlockDiagonalPreconditioner(GenericPreconditioner(p), n)
 
