@@ -146,7 +146,7 @@ class GradientDescent(UpdateRule):
         """
         if eigs is None:
             return None
-        lr = self.P(flat_state).pow(-1)(1.0)
+        lr = self.P(flat_state)(1.0)
         return eigs / lr
 
 
@@ -377,6 +377,8 @@ def preconditioner_ns(G: Array, steps: int) -> Tuple[Array, Array]:
         scale = (m / n) ** 0.5
         X = X * scale
         A = A * scale
+        # TODO: apply transpose in this case (see Muon original repo)
+        raise NotImplementedError("Muon preconditioner not implemented for m < n.")
 
     return X, A
 
@@ -454,6 +456,8 @@ class RegexOptimizerSelector(OptimizerSelector):
 class CompositeUpdateRule(UpdateRule):
     """An update rule that applies different optimizers to different parameter groups."""
 
+    lr: float = 0.01
+
     @dataclass
     class UpdateRuleGroup:
         """Utility class for grouping an optimizer with the parameter span it applies to."""
@@ -465,8 +469,8 @@ class CompositeUpdateRule(UpdateRule):
     def __post_init__(self):
         self.groups = []
         self.selector: OptimizerSelector = RegexOptimizerSelector(
-            matching_factory=lambda: GradientDescent(lr=100000), # TODO: bias layers are disabled for now
-            non_matching_factory=lambda: Muon(lr=0.0001, beta=0.95, ns_steps=5),
+            matching_factory=lambda: None, # TODO: bias layers are disabled for now
+            non_matching_factory=lambda: Muon(lr=self.lr, ns_steps=5),
             pattern=".*bias",
         )
 
