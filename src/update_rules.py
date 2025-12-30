@@ -388,7 +388,6 @@ class Muon(UpdateRule):
     """TODO"""
 
     lr: float = 0.02
-    beta: float = 0.95
     ns_steps: int = 5
 
     def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
