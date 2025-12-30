@@ -7,7 +7,7 @@ import torch
 
 from datasets import load_dataset as hf_load_dataset
 from src.loss_criterion import ce_categorical_loss, ce_binary_loss, mse_categorical_loss, \
-    mse_binary_loss, categorical_accuracy, binary_accuracy
+    mse_loss, mse_binary_loss, categorical_accuracy, binary_accuracy
 
 """Datasets that can be used."""
 
@@ -38,7 +38,7 @@ class Dataset(NamedTuple):
     criterion_fn: Callable[[Array, Array], Array]
     """Compute loss over a batch.  Signature: `(preds, labels) -> scalar`"""
 
-    accuracy_fn:  Callable[[Array, Array], Array]
+    accuracy_fn:  Callable[[Array, Array], Array] | None
     """Compute accuracy over a batch.  Signature: `(preds, labels) -> scalar`"""
 
     output_dim: int
@@ -532,4 +532,56 @@ class Copying(DatasetBuilder):
         train_x, test_x = x[: self.n], x[self.n :]
         train_y, test_y = y[: self.n], y[self.n :]
         
+        return Examples(train_x, train_y), Examples(test_x, test_y)
+
+
+@dataclass(kw_only=True)
+class Regression(DatasetBuilder):
+    """Basic linear regression task."""
+
+    # the number of training examples
+    n: int = 10000
+
+    # the number of test examples
+    n_test: int = 1000
+
+    # size of each example
+    n_features: int = 500
+
+    # whether to unevenly scale features (makes the problem harder)
+    uneven_scale: bool = True
+
+    def get_output_dim(self) -> int:
+        return 1
+
+    def get_loss_and_acc(self) -> Tuple[Callable, Callable]:
+        return mse_loss, None
+
+    def make(self, raw_data=None):
+        print(self.n)
+        rng = np.random.default_rng(seed=42)
+        X = torch.from_numpy(
+            rng.standard_normal((self.n + self.n_test, self.n_features)).astype(
+                np.float32
+            )
+        )
+
+        if self.uneven_scale:
+            scales = torch.logspace(0, 3, self.n_features)
+            X = X * scales
+
+        w = torch.from_numpy(
+            rng.standard_normal((self.n_features, 1)).astype(np.float32)
+        )
+
+        y = torch.mm(X, w) + 0.1 * torch.from_numpy(
+            rng.standard_normal((self.n + self.n_test, 1)).astype(np.float32)
+        )
+        X = X.numpy()
+        y = y.numpy()
+
+        # separate train from test
+        train_x, test_x = X[: self.n], X[self.n :]
+        train_y, test_y = y[: self.n], y[self.n :]
+
         return Examples(train_x, train_y), Examples(test_x, test_y)

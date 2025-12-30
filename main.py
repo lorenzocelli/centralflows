@@ -14,8 +14,8 @@ from tqdm import trange
 from tyro.conf import arg, subcommand
 
 from src import loggers
-from src.architectures import CNN, MLP, UnbiasedMLP, VIT, LSTM, Mamba, Transformer, Resnet
-from src.datasets import CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification #,#SparseParity, FlattenedMNIST
+from src.architectures import CNN, MLP, Linear, UnbiasedMLP, VIT, LSTM, Mamba, Transformer, Resnet
+from src.datasets import CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification, Regression #,#SparseParity, FlattenedMNIST
 from src.functional import FunctionalModel
 from src.loss_function import SupervisedLossFunction
 from src.processes import (
@@ -45,8 +45,8 @@ ValidOpt = Union[
     Annotated[RMSProp, subcommand("rmsprop")],
     Annotated[CompositeUpdateRule, subcommand("comp")],
 ]
-ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification]#, FlattenedMNIST, SparseParity]
-ValidArch = Union[CNN, MLP, UnbiasedMLP, VIT, LSTM, Mamba, Transformer, Resnet]
+ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification, Regression]#, FlattenedMNIST, SparseParity]
+ValidArch = Union[CNN, MLP, UnbiasedMLP, Linear, VIT, LSTM, Mamba, Transformer, Resnet]
 ValidRuns = Set[Literal["discrete", "midpoint", "central", "stable", "stationary"]]
 
 def main(

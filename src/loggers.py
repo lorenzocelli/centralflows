@@ -91,7 +91,9 @@ class LossAndAccuracy(ProcessLogger):
         x, y = batch
         out = self.model.apply(w, x)
         loss = self.data.criterion_fn(out, y)
-        acc = self.data.accuracy_fn(out, y)
+        acc = torch.tensor(-1.0)
+        if self.data.accuracy_fn is not None:
+            acc = self.data.accuracy_fn(out, y)
         return loss, acc
 
     def log(self, process: Process) -> Dict[str, Any]:

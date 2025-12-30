@@ -4,6 +4,7 @@ from .lstm import LSTM
 from .mamba import Mamba
 from .mlp import MLP
 from .mlp import UnbiasedMLP
+from .linear import Linear
 from .resnet import Resnet
 from .vit import VIT
 from .transformer import Transformer
