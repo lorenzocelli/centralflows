@@ -86,7 +86,7 @@ class EigConfig:
     
     # All eigenvalues of the effective Hessian that are
     # above this threshold will be tracked
-    track_threshold: float = 1.5
+    track_threshold: Optional[float] = 1.5
 
     # Number of eigenvalues to track initially.
     initial_neigs: int = 1
