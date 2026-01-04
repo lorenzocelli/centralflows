@@ -25,7 +25,7 @@ def stable_flow_substep(
 
     # compute time derivatives of w and state
     dstate_dt = opt.dstate_dt(state, gradient)
-    dw_dt = -P.pow(-1)(gradient)
+    dw_dt = -P(gradient)
 
     # take euler step
     new_state = state + dt * dstate_dt
@@ -50,8 +50,8 @@ def central_flow_substep(
 
     # decompose dw_dt = dw_dt_stable + dw_dt_X @ X
     # dw_dt_stable does not depend on X, dw_dt_X is the part that multiplies X
-    dw_dt_stable = -P.pow(-1)(gradient)  #       NOTE: [dim(w)]
-    dw_dt_X = -0.5 * vmap(P.pow(-1))(dH_dw).T  # NOTE: [dim(w), binom(k+1,2)]
+    dw_dt_stable = -P(gradient)  #       NOTE: [dim(w)]
+    dw_dt_X = -0.5 * vmap(P)(dH_dw).T  # NOTE: [dim(w), binom(k+1,2)]
 
     # decompose dstate_dt = dstate_dt_stable + dstate_dt_X @ X
     # see helper function compute_dstate_dt for details

@@ -14,8 +14,8 @@ from tqdm import trange
 from tyro.conf import arg, subcommand
 
 from src import loggers
-from src.architectures import CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet
-from src.datasets import CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification #,#SparseParity, FlattenedMNIST
+from src.architectures import CNN, MLP, Linear, UnbiasedMLP, VIT, LSTM, Mamba, Transformer, Resnet
+from src.datasets import CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification, Regression #,#SparseParity, FlattenedMNIST
 from src.functional import FunctionalModel
 from src.loss_function import SupervisedLossFunction
 from src.processes import (
@@ -30,7 +30,7 @@ from src.processes import (
     EigConfig
 )
 from src.saving import Checkpointer, DataSaver, LoadOptions
-from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp
+from src.update_rules import GradientDescent, RMSProp, ScalarRMSProp, CompositeUpdateRule
 from src.utils import convert_dataclasses
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -43,9 +43,10 @@ ValidOpt = Union[
     Annotated[GradientDescent, subcommand("gd")],
     Annotated[ScalarRMSProp, subcommand("scalar_rmsprop")],
     Annotated[RMSProp, subcommand("rmsprop")],
+    Annotated[CompositeUpdateRule, subcommand("comp")],
 ]
-ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification]#, FlattenedMNIST, SparseParity]
-ValidArch = Union[CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet]
+ValidData = Union[CIFAR10, SST2, Sorting, Copying, Moons, Circles, Classification, Regression]#, FlattenedMNIST, SparseParity]
+ValidArch = Union[CNN, MLP, UnbiasedMLP, Linear, VIT, LSTM, Mamba, Transformer, Resnet]
 ValidRuns = Set[Literal["discrete", "midpoint", "central", "stable", "stationary"]]
 
 def main(
@@ -101,7 +102,7 @@ def main(
     w, model_fn = FunctionalModel.make_functional(model)
     
     # initialize optimizer state
-    state = opt.initialize_state(w) 
+    state = opt.initialize_state(w, model_fn.unflatten) 
     
     # put together loss function
     loss_fn = SupervisedLossFunction(

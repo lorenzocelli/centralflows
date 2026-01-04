@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
+import re
 
 from .utils import flatten_pytree
 
@@ -26,11 +27,12 @@ class UpdateRule:
     The functional design here is inspired by Jax's Optax library.
     """
         
-    def initialize_state(self, w: torch.Tensor) -> Array:
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         """Initialize the state.
         
         Args:
           w: the initial weights
+          unflatten_w (callable): function to unflatten weights
           
         Returns:
           Array: the state, as a flat vector (see subclasses for examples)
@@ -86,7 +88,7 @@ class UpdateRule:
     def update(self, w: Array, flat_state: Array, gradient: Array) -> Tuple[Array, Array]:
         """Update both the weights and optimizer state."""
         flat_state = self.update_state(flat_state, gradient)
-        w = w - self.P(flat_state).pow(-1)(gradient)
+        w = w - self.P(flat_state)(gradient)
         return w, flat_state
 
 
@@ -105,14 +107,17 @@ class GradientDescent(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
-        state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+        }
         flat_state, self.unflatten = flatten_pytree(state)
+        self.n = w.shape[0]
         return flat_state
 
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        return DiagonalPreconditioner(1 / self.lr_fn(state["t"]))
+        return DiagonalPreconditioner(self.lr_fn(state["t"]), self.n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -141,7 +146,7 @@ class GradientDescent(UpdateRule):
         """
         if eigs is None:
             return None
-        lr = self.P(flat_state).pow(-1)(1.0)
+        lr = self.P(flat_state)(1.0)
         return eigs / lr
 
 
@@ -169,12 +174,13 @@ class ScalarRMSProp(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "nu": torch.tensor(0.0, dtype=w.dtype, device=w.device),
         }
         flat_state, self.unflatten = flatten_pytree(state)
+        self.n = w.shape[0]
         return flat_state
 
     def P(self, flat_state: Array) -> Array:
@@ -185,7 +191,7 @@ class ScalarRMSProp(UpdateRule):
         else:
             nu_hat = nu
         lrs = self.lr_fn(t) / (torch.sqrt(nu_hat) + self.eps)
-        return DiagonalPreconditioner(1 / lrs)
+        return DiagonalPreconditioner(lrs, self.n)
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -251,7 +257,7 @@ class RMSProp(UpdateRule):
     def __post_init__(self):
         self.lr_fn = to_schedule(self.lr)
 
-    def initialize_state(self, w: Array) -> Array:
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
             "nu": torch.zeros_like(w),
@@ -267,7 +273,7 @@ class RMSProp(UpdateRule):
         else:
             nu_hat = nu
         lrs = self.lr_fn(t) / (torch.sqrt(nu_hat) + self.eps)
-        return DiagonalPreconditioner(1 / lrs)
+        return DiagonalPreconditioner(lrs, nu.shape[0])
 
     def update_state(self, flat_state: Array, gradient: Array) -> Array:
         state = self.unflatten(flat_state)
@@ -296,6 +302,222 @@ class RMSProp(UpdateRule):
         }
 
 
+def preconditioner_ns(G: Array, steps: int) -> Tuple[Array, Array]:
+    """
+    Performs the Newton-Schulz iteration to compute the Muon update and the explicit
+    preconditioner matrix.
+
+    DESIGN CHOICE: "Parallel Identity" Algorithm
+    --------------------------------------------
+    Standard Muon only computes the update X_K = P^{-1} G_0. However, to analyze eigenvalues
+    of P^{-1}H, we need the explicit operator P^{-1}.
+    This function runs a parallel iteration on an accumulator matrix A (initialized to Identity)
+    applying the same transformations B(X_k) to A that are applied to X.
+    By linearity, if X_{k+1} = B(X_k) X_k, then A_{final} satisfies X_{final} = A_{final} G_0.
+    Thus, A_final is the explicit matrix form of P^{-1}.
+
+    Mathematical Notation (from Proposal):
+    - Input G is the gradient block G_0 (or momentum).
+    - X tracks the iterates X_k, converging to the orthogonalized update.
+    - A tracks the preconditioner P_{Muon}^{-1}(G_0).
+    - The polynomial update is B(X) = alpha*I + beta*XX^T + gamma*(XX^T)^2.
+
+    Args:
+        G (Tensor): The input matrix G_0 (usually momentum).
+        steps (int): Number of Newton-Schulz steps (usually 5).
+
+    Returns:
+        X (Tensor): The final update step X_K approx P^{-1} G_0.
+        A (Tensor): The explicit left-preconditioner matrix P_{Muon}^{-1}(G_0).
+    """
+    assert G.ndim == 2
+    m, n = G.shape
+
+    # 1. Normalization
+    # We define the scaling factor c = ||G_0||_F + epsilon.
+    # To ensure stability, inputs to Newton-Schulz must have spectral norm < 1.
+    norm = G.norm(dim=(-2, -1), keepdim=True) + 1e-7
+
+    # Initialize iterates.
+    # We delay the final Muon scaling factor (sqrt(m/n)) until the end to avoid
+    # exploding values during the iteration if m >> n.
+    # X_0 = (1/c) * G_0
+    X = G / norm
+
+    # Initialize the accumulator A.
+    # Since X_0 = (1/c) * I * G_0, the operator starts as A_0 = (1/c) * I.
+    A = torch.eye(m, dtype=G.dtype, device=G.device) / norm
+
+    # Quintic coefficients for the polynomial B(X).
+    # These correspond to alpha, beta, gamma in the proposal's update rule.
+    a, b, c = (3.4445, -4.7750, 2.0315)
+
+    # 2. Iteration
+    for _ in range(steps):
+        # Compute X_k * X_k^T
+        XXt = X @ X.mT
+
+        # Compute the polynomial B(X_k) = alpha*I + beta*XX^T + gamma*(XX^T)^2
+        # This operator is symmetric and depends only on the singular values of X_k.
+        B = a * torch.eye(m, device=G.device, dtype=G.dtype) + b * XXt + c * (XXt @ XXt)
+
+        # Update X: X_{k+1} = B(X_k) @ X_k
+        X = B @ X
+
+        # Update A: A_{k+1} = B(X_k) @ A_k
+        # We apply the exact same left-operator B(X_k) to A.
+        # This preserves the invariant X_k = A_k @ G_0.
+        A = B @ A
+
+    # 3. Muon Scaling
+    # The proposal defines the final update as scaled by sqrt(max(1, m/n)).
+    # We apply this scalar factor to both the update X and the operator A
+    # so that X = A @ G_0 still holds.
+    if m > n:
+        scale = (m / n) ** 0.5
+        X = X * scale
+        A = A * scale
+        # TODO: apply transpose in this case (see Muon original repo)
+        raise NotImplementedError("Muon preconditioner not implemented for m < n.")
+
+    return X, A
+
+
+@dataclass
+class Muon(UpdateRule):
+    """TODO"""
+
+    lr: float = 0.02
+    ns_steps: int = 5
+
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
+        self.unflatten_w = unflatten_w
+        matrix_w = unflatten_w(w)
+        assert matrix_w.ndim >= 2
+
+        state = {
+            "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
+            "gradient": torch.zeros_like(matrix_w),
+        }
+        flat_state, self.unflatten = flatten_pytree(state)
+        return flat_state
+
+    def P(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        gradient = state["gradient"]
+        _, p = preconditioner_ns(gradient, steps=self.ns_steps)
+        p.mul_(self.lr)
+        n = max(gradient.size(-2), gradient.size(-1))
+        return SingleBlockDiagonalPreconditioner(GenericPreconditioner(p), n)
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        state = self.unflatten(flat_state)
+        gradient = self.unflatten_w(gradient)
+
+        if gradient.ndim == 4:  # for the case of conv filters
+            raise NotImplementedError(
+                "Muon optimizer does not support dim > 2 yet."
+            )
+            gradient = gradient.view(len(gradient), -1)
+
+        state = {"t": state["t"] + 1.0, "gradient": gradient}
+        return flatten_pytree(state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Array:
+        # TODO
+        return {}
+
+
+@dataclass
+class OptimizerSelector:
+    """Generic class for selecting optimizers for different layers."""
+
+    def get_optimizer(self, layer_name: str):
+        """Return the appropriate optimizer for the given layer."""
+        raise NotImplementedError()
+
+
+@dataclass
+class RegexOptimizerSelector(OptimizerSelector):
+    """Select optimizers based on whether the layer name matches a regex pattern."""
+
+    matching_factory: callable[UpdateRule]
+    non_matching_factory: callable[UpdateRule]
+    pattern: str
+
+    def get_optimizer(self, layer_name: str) -> UpdateRule:
+        if re.search(self.pattern, layer_name):
+            return self.matching_factory()
+        return self.non_matching_factory()
+
+
+@dataclass
+class CompositeUpdateRule(UpdateRule):
+    """An update rule that applies different optimizers to different parameter groups."""
+
+    lr: float = 0.01
+
+    @dataclass
+    class UpdateRuleGroup:
+        """Utility class for grouping an optimizer with the parameter span it applies to."""
+
+        layer_name: str
+        span: Tuple[int, int]
+        optimizer: UpdateRule
+
+    def __post_init__(self):
+        self.groups = []
+        self.selector: OptimizerSelector = RegexOptimizerSelector(
+            matching_factory=lambda: None, # TODO: bias layers are disabled for now
+            non_matching_factory=lambda: Muon(lr=self.lr, ns_steps=5),
+            pattern=".*bias",
+        )
+
+    def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
+        indices = torch.arange(w.shape[0])
+        tree_w = unflatten_w(w)
+        tree_ix = unflatten_w(torch.tensor(indices))
+
+        for layer_name in tree_w.keys():
+            optimizer = self.selector.get_optimizer(layer_name)
+            indices = tree_ix[layer_name]
+            span = (indices.min().item(), indices.max().item() + 1)
+            self.groups.append(
+                CompositeUpdateRule.UpdateRuleGroup(layer_name, span, optimizer)
+            )
+
+        self.groups.sort(key=lambda g: g.span[0])
+
+        state = {"t": torch.tensor(0.0, dtype=w.dtype, device=w.device)}
+        for group in self.groups:
+            w_slice = w[group.span[0] : group.span[1]]
+            _, unflatten_w_slice = flatten_pytree(tree_w[group.layer_name])
+            state[group.layer_name] = group.optimizer.initialize_state(w_slice, unflatten_w_slice)
+
+        flat_state, self.unflatten = flatten_pytree(state)
+        return flat_state
+
+    def P(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        return BlockDiagonalPreconditioner(
+            [group.optimizer.P(state[group.layer_name]) for group in self.groups]
+        )
+
+    def update_state(self, flat_state: Array, gradient: Array) -> Array:
+        state = self.unflatten(flat_state)
+        state["t"] += 1.0
+        for group in self.groups:
+            grad_slice = gradient[group.span[0] : group.span[1]]
+            state[group.layer_name] = group.optimizer.update_state(
+                state[group.layer_name], grad_slice
+            )
+        return flatten_pytree(state)[0]
+
+    def summarize_state(self, flat_state: Array) -> Array:
+        state = self.unflatten(flat_state)
+        return {"t": state["t"]}
+
+
 class Preconditioner:
     """Abstract class for a preconditioner."""
     
@@ -310,34 +532,131 @@ class Preconditioner:
         """
         raise NotImplementedError()
     
-    def pow(self, p: float) -> Preconditioner:
-        """Return a new preconditioner which is this preconditioner raised to a power.
-        
-        Args:
-          p: the power
+    def sqrt(self) -> Preconditioner:
+        """Return a new preconditioner which is the square root of this preconditioner.
         
         Returns:
           (Preconditioner): a new preconditioner
         """
         raise NotImplementedError()
 
+    def size(self) -> int:
+        """Return the size of the preconditioner."""
+        raise NotImplementedError()
+
+
+class GenericPreconditioner(Preconditioner):
+    """A generic preconditioner represented as a matrix."""
+
+    def __init__(self, P: Array):
+        """Constructor for the generic preconditioner.
+
+        Args:
+          P (Array): the preconditioner, as a matrix
+        """
+        if P.ndim != 2 or P.shape[0] != P.shape[1]:
+            raise ValueError("Preconditioner must be a square matrix.")
+
+        self.P = P
+
+    def __call__(self, v: Array) -> Array:
+        return self.P @ v
+
+    def sqrt(self) -> GenericPreconditioner:
+        # Compute sqrt with eigendecomposition
+        eigenvalues, eigenvectors = torch.linalg.eigh(self.P)
+        eigenvalues = torch.clamp(eigenvalues, 0)
+        root_eigenvalues = torch.sqrt(eigenvalues)
+        sqrt = eigenvectors @ (root_eigenvalues[:, None] * eigenvectors.T)
+        return GenericPreconditioner(sqrt)
+
+    def size(self) -> int:
+        return self.P.shape[0]
+
 
 class DiagonalPreconditioner(Preconditioner):
     """A diagonal (i.e. elementwise) preconditioner."""
     
-    def __init__(self, P):
+    def __init__(self, P, n: int):
         """Constructor for the diagonal preconditioner.
+        Note: the size is a required argument since P may be a 
+        scalar, in which case its size cannot be inferred.
         
         Args:
           P (Array): the diagonal preconditioner, as a vector
+          n (int): the size of the preconditioner
         """
+        if isinstance(P, torch.Tensor) and P.isinf().any():
+            raise ValueError("Preconditioner contains infinite values.")
+        self.n = n
         self.P = P
 
     def __call__(self, v: Array) -> Array:
         return v * self.P
 
-    def pow(self, power: float) -> DiagonalPreconditioner:
-        return DiagonalPreconditioner(self.P**power)
+    def sqrt(self) -> DiagonalPreconditioner:
+        return DiagonalPreconditioner(self.P**0.5, self.n)
+
+    def size(self) -> int:
+        return self.n
+
+
+class BlockDiagonalPreconditioner(Preconditioner):
+    """A block-diagonal preconditioner."""
+
+    def __init__(self, blocks: list[Preconditioner]):
+        """Constructor for the block diagonal preconditioner.
+
+        Args:
+          blocks (list[Preconditioner]): the diagonal blocks of the preconditioner
+        """
+        self.blocks = blocks
+
+    def __call__(self, v: Array) -> Array:
+        offset = 0
+        result = torch.zeros_like(v)
+        for block in self.blocks:
+            block_size = block.size()
+            result[offset : offset + block_size] = block(
+                v[offset : offset + block_size]
+            )
+            offset += block_size
+        return result
+
+    def sqrt(self) -> BlockDiagonalPreconditioner:
+        new_blocks = [block.sqrt() for block in self.blocks]
+        return BlockDiagonalPreconditioner(new_blocks)
+
+    def size(self) -> int:
+        return sum(block.size() for block in self.blocks)
+
+
+class SingleBlockDiagonalPreconditioner(Preconditioner):
+    def __init__(self, block: Preconditioner, n: int):
+        """
+        Initialize a block diagonal preconditioner with a 
+        single block repeated along the diagonal.
+        
+        Args:
+          block (Preconditioner): the block to repeat
+          n (int): the number of times to repeat the block
+        """
+        self.block = block
+        self.n = n
+    
+    def __call__(self, v: Array) -> Array:
+        result = torch.zeros_like(v)
+        for i in range(self.n):
+            start = i * self.block.size()
+            end = start + self.block.size()
+            result[start:end] = self.block(v[start:end])
+        return result
+
+    def sqrt(self) -> SingleBlockDiagonalPreconditioner:
+        return SingleBlockDiagonalPreconditioner(self.block.sqrt(), self.n)
+    
+    def size(self) -> int:
+        return self.n * self.block.size()
 
 
 def to_schedule(schedule_or_constant):

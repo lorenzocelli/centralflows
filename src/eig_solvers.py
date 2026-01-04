@@ -52,7 +52,7 @@ def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_
     if warm_start_eigenvectors is None:
         warm_start_eigenvectors = _initialize_eigenvectors(len(w), neigs, w)
     
-    P_inv_sqrt = (lambda x: x) if P is None else P.pow(-1 / 2)
+    P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
     
     matvec_count = 0
 
@@ -180,7 +180,7 @@ class WarmStartEigSolver:
         if self.return_sym_evecs:
             eigenvectors = self.symU
         else:
-            P_inv_sqrt = (lambda x: x) if P is None else P.pow(-1 / 2)
+            P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
             eigenvectors = vmap(P_inv_sqrt, 1, 1)(self.symU)
             
         return eigs, eigenvectors, log
