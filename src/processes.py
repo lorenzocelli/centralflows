@@ -516,8 +516,8 @@ class EigManager:
         
     def get(self, w: Array, P: Optional[Preconditioner] = None):
         if self.config.frequency > 0:
-            # Only compute the square root when we need it
-            P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
+            # Only compute the decomposition when we need it (frequency > 0)
+            P_0 = (lambda x: x) if P is None else P.decompose()[0]
 
         # if frequency == -1, never compute the eigenpairs
         if self.config.frequency <= 0:
@@ -530,17 +530,17 @@ class EigManager:
         ):        
             eigs, symU, log = self.solver.update(w, P=P)
             self.cache.update(symU=symU, eigs=eigs, counter=self.counter)
-            U = vmap(P_inv_sqrt, 1, 1)(symU) # convert to right evecs of P^{-1} H
+            U = vmap(P_0, 1, 1)(symU) # convert to right evecs of P^{-1} H
         # otherwise, compute and return the poor man's approximation to the top
         # eigenvalues of the effective Hessian. 
         else:
             symU = self.cache["symU"]
-            hessian_diag = vmap(lambda u: self.loss_fn.D(w, 2, P_inv_sqrt(u), P_inv_sqrt(u)), 1)(symU)
+            hessian_diag = vmap(lambda u: self.loss_fn.D(w, 2, P_0(u), P_0(u)), 1)(symU)
             # TODO do we really need this?
             order = torch.argsort(hessian_diag, descending=True)
             eigs, symU = hessian_diag[order], symU[:, order]
             self.cache.update(eigs=eigs, symU=symU)
-            U = vmap(P_inv_sqrt, 1, 1)(symU) # convert to right evecs of P^{-1} H
+            U = vmap(P_0, 1, 1)(symU) # convert to right evecs of P^{-1} H
             log = {}
 
         self.counter += 1

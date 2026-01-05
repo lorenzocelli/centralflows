@@ -51,15 +51,15 @@ def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_
     
     if warm_start_eigenvectors is None:
         warm_start_eigenvectors = _initialize_eigenvectors(len(w), neigs, w)
-    
-    P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
-    
+
+    P_0, P_1 = (lambda x: x, lambda x: x) if P is None else P.decompose()
+
     matvec_count = 0
 
     def matvec(v):
         nonlocal matvec_count
         matvec_count += np.prod(v.shape[1:])        
-        _matvec = lambda v: P_inv_sqrt(loss_fn.D(w, 2, P_inv_sqrt(v)))
+        _matvec = lambda v: P_0(loss_fn.D(w, 2, P_1(v)))
         _matvec = torch.func.vmap(_matvec, 1, 1, chunk_size=chunk_size)
         return _matvec(v)
     
@@ -80,7 +80,7 @@ def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_
     log['matvec_count'] = matvec_count
     
     if not return_sym_evecs:
-        eigenvectors = vmap(P_inv_sqrt, 1, 1)(eigenvectors)
+        eigenvectors = vmap(P_0, 1, 1)(eigenvectors)
     
     return eigenvalues, eigenvectors, log
 
@@ -180,8 +180,8 @@ class WarmStartEigSolver:
         if self.return_sym_evecs:
             eigenvectors = self.symU
         else:
-            P_inv_sqrt = (lambda x: x) if P is None else P.sqrt()
-            eigenvectors = vmap(P_inv_sqrt, 1, 1)(self.symU)
+            P_0 = (lambda x: x) if P is None else P.decompose()[0]
+            eigenvectors = vmap(P_0, 1, 1)(self.symU)
             
         return eigs, eigenvectors, log
 

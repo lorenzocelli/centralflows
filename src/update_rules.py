@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
+from enum import StrEnum
 
 import numpy as np
 import torch
@@ -523,6 +524,12 @@ class CompositeUpdateRule(UpdateRule):
         return {"t": state["t"], **summaries}
 
 
+class DecompositionMethod(StrEnum):
+    """Enum for preconditioner decomposition methods."""
+    CHOLESKY = "cholesky"
+    SQRT = "sqrt"
+
+
 class Preconditioner:
     """Abstract class for a preconditioner."""
     
@@ -536,10 +543,49 @@ class Preconditioner:
           the preconditioned vector Pv
         """
         raise NotImplementedError()
-    
+
+    def decompose(
+        self, method: DecompositionMethod = DecompositionMethod.SQRT
+    ) -> Tuple[Preconditioner, Preconditioner]:
+        """
+        Decompose the preconditioner in two matrices A, B such that P = AB
+        using the specified decomposition method. For convenience, we return
+        B, A since we then apply them to the Hessian H as B@H@A.
+
+        Args:
+            method (DecompositionMethod): the decomposition method to use
+        Returns:
+            (Tuple[Preconditioner, Preconditioner]): the two preconditioners B, A
+        """
+        if method == DecompositionMethod.CHOLESKY:
+            L = self.cholesky()
+            return L.transpose(), L
+        elif method == DecompositionMethod.SQRT:
+            S = self.sqrt()
+            return S, S
+
+        raise NotImplementedError(f"Unknown decomposition method: {method}")
+
     def sqrt(self) -> Preconditioner:
         """Return a new preconditioner which is the square root of this preconditioner.
-        
+
+        Returns:
+          (Preconditioner): a new preconditioner
+        """
+        raise NotImplementedError()
+
+    def cholesky(self) -> Preconditioner:
+        """
+        Return a new preconditioner which is the Cholesky factor of this preconditioner.
+
+        Returns:
+          (Preconditioner): a new preconditioner
+        """
+        raise NotImplementedError()
+
+    def transpose(self) -> Preconditioner:
+        """Return a new preconditioner which is the transpose of this preconditioner.
+
         Returns:
           (Preconditioner): a new preconditioner
         """
@@ -574,6 +620,13 @@ class GenericPreconditioner(Preconditioner):
         root_eigenvalues = torch.sqrt(eigenvalues)
         sqrt = eigenvectors @ (root_eigenvalues[:, None] * eigenvectors.T)
         return GenericPreconditioner(sqrt)
+    
+    def cholesky(self) -> GenericPreconditioner:
+        lt = torch.linalg.cholesky(self.P)
+        return GenericPreconditioner(lt)
+    
+    def transpose(self) -> GenericPreconditioner:
+        return GenericPreconditioner(self.P.T)
 
     def size(self) -> int:
         return self.P.shape[0]
@@ -601,7 +654,13 @@ class DiagonalPreconditioner(Preconditioner):
 
     def sqrt(self) -> DiagonalPreconditioner:
         return DiagonalPreconditioner(self.P**0.5, self.n)
+    
+    def cholesky(self) -> DiagonalPreconditioner:
+        return DiagonalPreconditioner(self.P**0.5, self.n)
 
+    def transpose(self) -> DiagonalPreconditioner:
+        return DiagonalPreconditioner(self.P, self.n)
+    
     def size(self) -> int:
         return self.n
 
@@ -632,6 +691,14 @@ class BlockDiagonalPreconditioner(Preconditioner):
         new_blocks = [block.sqrt() for block in self.blocks]
         return BlockDiagonalPreconditioner(new_blocks)
 
+    def cholesky(self) -> BlockDiagonalPreconditioner:
+        new_blocks = [block.cholesky() for block in self.blocks]
+        return BlockDiagonalPreconditioner(new_blocks)
+
+    def transpose(self) -> BlockDiagonalPreconditioner:
+        new_blocks = [block.transpose() for block in self.blocks]
+        return BlockDiagonalPreconditioner(new_blocks)
+
     def size(self) -> int:
         return sum(block.size() for block in self.blocks)
 
@@ -659,7 +726,13 @@ class SingleBlockDiagonalPreconditioner(Preconditioner):
 
     def sqrt(self) -> SingleBlockDiagonalPreconditioner:
         return SingleBlockDiagonalPreconditioner(self.block.sqrt(), self.n)
-    
+
+    def cholesky(self) -> SingleBlockDiagonalPreconditioner:
+        return SingleBlockDiagonalPreconditioner(self.block.cholesky(), self.n)
+
+    def transpose(self) -> SingleBlockDiagonalPreconditioner:
+        return SingleBlockDiagonalPreconditioner(self.block.transpose(), self.n)
+
     def size(self) -> int:
         return self.n * self.block.size()
 
