@@ -424,8 +424,8 @@ class Muon(UpdateRule):
         return flatten_pytree(state)[0]
 
     def summarize_state(self, flat_state: Array) -> Array:
-        # TODO
-        return {}
+        state = self.unflatten(flat_state)
+        return {"t": state["t"], "lr": self.lr}
 
 
 @dataclass
@@ -515,7 +515,12 @@ class CompositeUpdateRule(UpdateRule):
 
     def summarize_state(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        return {"t": state["t"]}
+        summaries = {}
+        for group in self.groups:
+            summaries[group.layer_name] = group.optimizer.summarize_state(
+                state[group.layer_name]
+            )
+        return {"t": state["t"], **summaries}
 
 
 class Preconditioner:
