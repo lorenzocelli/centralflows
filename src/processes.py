@@ -12,7 +12,7 @@ from .sdcp import SDCPSolver
 from .eig_solvers import WarmStartEigSolver
 from .flows import central_flow_substep, stable_flow_substep
 from .loss_function import LossFunction
-from .update_rules import UpdateRule, Preconditioner
+from .update_rules import UpdateRule, DecompositionMethod, Preconditioner
 from .utils import Timer, apply_to_pairs, apply_overrides
 
 Array = Any
@@ -103,6 +103,9 @@ class EigConfig:
     # Whether to compute the eigenvalues of the "raw" Hessian in addition
     # to the eigenvalues of the effective Hessian
     raw_eigenvalues: bool = True
+
+    # Method to use for preconditioner decomposition
+    decomposition_method: DecompositionMethod = DecompositionMethod.SQRT
     
 
 # process-specific EigConfig overrides.
@@ -517,7 +520,7 @@ class EigManager:
     def get(self, w: Array, P: Optional[Preconditioner] = None):
         if self.config.frequency > 0:
             # Only compute the decomposition when we need it (frequency > 0)
-            P_0 = (lambda x: x) if P is None else P.decompose()[0]
+            P_dec = (lambda x: x, lambda x: x) if P is None else P.decompose(self.config.decomposition_method)
 
         # if frequency == -1, never compute the eigenpairs
         if self.config.frequency <= 0:
@@ -528,19 +531,19 @@ class EigManager:
         elif self.cache["counter"] is None or (
             self.counter >= self.cache["counter"] + self.config.frequency
         ):        
-            eigs, symU, log = self.solver.update(w, P=P)
+            eigs, symU, log = self.solver.update(w, P_dec=P_dec)
             self.cache.update(symU=symU, eigs=eigs, counter=self.counter)
-            U = vmap(P_0, 1, 1)(symU) # convert to right evecs of P^{-1} H
+            U = vmap(P_dec[0], 1, 1)(symU) # convert to right evecs of P^{-1} H
         # otherwise, compute and return the poor man's approximation to the top
         # eigenvalues of the effective Hessian. 
         else:
             symU = self.cache["symU"]
-            hessian_diag = vmap(lambda u: self.loss_fn.D(w, 2, P_0(u), P_0(u)), 1)(symU)
+            hessian_diag = vmap(lambda u: self.loss_fn.D(w, 2, P_dec[0](u), P_dec[0](u)), 1)(symU)
             # TODO do we really need this?
             order = torch.argsort(hessian_diag, descending=True)
             eigs, symU = hessian_diag[order], symU[:, order]
             self.cache.update(eigs=eigs, symU=symU)
-            U = vmap(P_0, 1, 1)(symU) # convert to right evecs of P^{-1} H
+            U = vmap(P_dec[0], 1, 1)(symU) # convert to right evecs of P^{-1} H
             log = {}
 
         self.counter += 1

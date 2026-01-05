@@ -16,7 +16,7 @@ Array = Any
 
 
 def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_eigenvectors: Array = None,
-                P: Optional[Preconditioner] = None, return_sym_evecs: bool = False, solver: str = "lobpcg",
+                P_dec: Optional[Tuple[Preconditioner, Preconditioner]] = None, return_sym_evecs: bool = False, solver: str = "lobpcg",
                 tol: float = 1e-10, chunk_size=-1) -> Tuple[Array, Array, Dict]:
     """Computes top eigenvectors/eigenvalues of the Hessian (or preconditioned Hessian).
     
@@ -52,7 +52,7 @@ def compute_eigs(loss_fn: LossFunction, w: Array, neigs: int = None, warm_start_
     if warm_start_eigenvectors is None:
         warm_start_eigenvectors = _initialize_eigenvectors(len(w), neigs, w)
 
-    P_0, P_1 = (lambda x: x, lambda x: x) if P is None else P.decompose()
+    P_0, P_1 = P_dec or (lambda x: x, lambda x: x)
 
     matvec_count = 0
 
@@ -138,7 +138,7 @@ class WarmStartEigSolver:
         # These are eigenvectors of the 'symmetric' preconditioned Hessian P^{-1/2} H P^{-1/2}.
         self.symU = torch.randn((len(w_example), 0), dtype=w_example.dtype, device=w_example.device)
 
-    def update(self, w: Array, P: Optional[Preconditioner] = None) -> Tuple[Array, Array, Dict]:
+    def update(self, w: Array, P_dec: Optional[Tuple[Preconditioner, Preconditioner]] = None) -> Tuple[Array, Array, Dict]:
         """Re-run the Hessian eigenvalue solver.
         
         Args:
@@ -161,7 +161,7 @@ class WarmStartEigSolver:
 
             # compute the new eigenvalues and eigenvectors
             eigs, symU, log = compute_eigs(
-                self.loss_fn, w, P=P, return_sym_evecs=self.return_sym_evecs, warm_start_eigenvectors=self.symU,
+                self.loss_fn, w, P_dec=P_dec, return_sym_evecs=self.return_sym_evecs, warm_start_eigenvectors=self.symU,
                 solver=self.solver, tol=self.tol, chunk_size=self.chunk_size)
 
             # break if we aren't enforcing a track threshold

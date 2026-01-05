@@ -545,7 +545,7 @@ class Preconditioner:
         raise NotImplementedError()
 
     def decompose(
-        self, method: DecompositionMethod = DecompositionMethod.SQRT
+        self, method: DecompositionMethod
     ) -> Tuple[Preconditioner, Preconditioner]:
         """
         Decompose the preconditioner in two matrices A, B such that P = AB
