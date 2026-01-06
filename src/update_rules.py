@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 import numpy as np
 import torch
 import re
+from tqdm import tqdm
 
 from .utils import flatten_pytree
 
@@ -419,6 +420,42 @@ class Muon(UpdateRule):
                 "Muon optimizer does not support dim > 2 yet."
             )
             gradient = gradient.view(len(gradient), -1)
+
+        # Ab cazzum ortogonalità ogni 2 step
+        step = state["t"].item()
+        if step % 2 == 0:
+            # X è già l'update ortogonalizzato P_base @ gradient
+            X, _ = preconditioner_ns(gradient, steps=self.ns_steps)
+            m, n = X.shape
+           
+            
+    # Normalize rows of X to make them ortonormal (not just orthogonal)
+    # Newton-Schulz converges to orthogonal rows but not necessarily normalized
+            row_norms = X.norm(dim=1, keepdim=True)
+            X = X / (row_norms + 1e-10)
+            
+            # Verifica che X abbia righe/colonne ortonormali
+            if m <= n: #alla fine si realizza sempre questo
+                # Verifica righe ortonormali: X @ X^T dovrebbe essere I
+                ortho_check = X @ X.mT
+                identity = torch.eye(m, dtype=X.dtype, device=X.device)
+                ortho_error = torch.linalg.norm(ortho_check - identity, ord='fro')
+                
+                # Diagnostica: controlla autovalori e norma diagonale
+                eigenvals = torch.linalg.eigvalsh(ortho_check)
+                diag_norms = torch.diagonal(ortho_check)
+                
+                # ho sostituito questo al print per non rompere la barra di progresso
+                tqdm.write(f"[Step {int(step)}] shape={X.shape}")
+                tqdm.write(f"  ||X @ X^T - I||_F = {ortho_error.item():.6e}")
+                tqdm.write(f"  diag(X@X^T): min={diag_norms.min():.3f}, max={diag_norms.max():.3f}, mean={diag_norms.mean():.3f}")
+                tqdm.write(f"  eigenvalues: min={eigenvals.min():.3f}, max={eigenvals.max():.3f}")
+            else:
+                # Verifica colonne ortonormali: X^T @ X dovrebbe essere I
+                ortho_check = X.mT @ X
+                identity = torch.eye(n, dtype=X.dtype, device=X.device)
+                ortho_error = torch.linalg.norm(ortho_check - identity, ord='fro')
+                tqdm.write(f"[Step {int(step)}] shape={X.shape} ||X^T @ X - I||_F = {ortho_error.item():.6e}")
 
         state = {"t": state["t"] + 1.0, "gradient": gradient}
         return flatten_pytree(state)[0]
