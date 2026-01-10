@@ -530,7 +530,7 @@ class Preconditioner:
         """Precondition a vector.
         
         Args:
-          v: the vector to precondition
+          v: the vector to precondition or a matrix whose columns are vectors to precondition
           
         Returns:
           the preconditioned vector Pv
@@ -650,12 +650,9 @@ class SingleBlockDiagonalPreconditioner(Preconditioner):
         self.n = n
     
     def __call__(self, v: Array) -> Array:
-        result = torch.zeros_like(v)
-        for i in range(self.n):
-            start = i * self.block.size()
-            end = start + self.block.size()
-            result[start:end] = self.block(v[start:end])
-        return result
+        v = v.reshape(self.block.size(), self.n)
+        result = self.block(v)
+        return result.flatten()
 
     def sqrt(self) -> SingleBlockDiagonalPreconditioner:
         return SingleBlockDiagonalPreconditioner(self.block.sqrt(), self.n)
