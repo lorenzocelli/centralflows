@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -389,19 +389,11 @@ class Muon(UpdateRule):
 
     lr: float = 0.02
     ns_steps: int = 5
-    frozen: bool = False # if True, the preconditioner is not updated over time, keep the initial one
 
     def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         self.unflatten_w = unflatten_w
         matrix_w = unflatten_w(w)
         assert matrix_w.ndim >= 2
-
-        # Initialize the frozen preconditioner if needed
-        if self.frozen:
-            self._frozen_preconditioner = None
-
-        print("Inside Muon")
-        print("Using frozen preconditioner:", self.frozen)
 
         state = {
             "t": torch.tensor(0.0, dtype=w.dtype, device=w.device),
@@ -413,17 +405,7 @@ class Muon(UpdateRule):
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
         gradient = state["gradient"]
-
-        # Handle frozen preconditioner
-        if self.frozen and self._frozen_preconditioner is not None:
-            p = self._frozen_preconditioner.clone()
-        else:
-            _, p = preconditioner_ns(gradient, steps=self.ns_steps)
-            if self.frozen and self._frozen_preconditioner is None:
-                # Cache the frozen preconditioner
-                self._frozen_preconditioner = p.clone()
-                p = p.clone()
-        
+        _, p = preconditioner_ns(gradient, steps=self.ns_steps)
         p.mul_(self.lr)
         n = max(gradient.size(-2), gradient.size(-1))
         return SingleBlockDiagonalPreconditioner(GenericPreconditioner(p), n)
@@ -444,6 +426,34 @@ class Muon(UpdateRule):
     def summarize_state(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
         return {"t": state["t"], "lr": self.lr}
+
+
+@dataclass
+class FrozenMuon(Muon):
+    """
+    A Muon optimizer that freezes its state according to a schedule.
+    """
+
+    freeze_schedule: list[int] = field(default_factory=list)
+
+    def update_state(self, flat_state, gradient):
+        state = self.unflatten(flat_state)
+        t = state["t"].item()
+
+        i = 0
+        for step in self.freeze_schedule:
+            if step >= t:
+                break
+            i += 1
+
+        if i % 2 == 0:
+            # Update the state
+            state = self.unflatten(super().update_state(flat_state, gradient))
+        else:
+            # Keep the state frozen and update the time only
+            state["t"] += 1.0
+
+        return flatten_pytree(state)[0]
 
 
 @dataclass
@@ -474,7 +484,7 @@ class CompositeUpdateRule(UpdateRule):
     """An update rule that applies different optimizers to different parameter groups."""
 
     lr: float = 0.01
-    frozen_muon: bool = False
+    freeze_schedule: list[int] = field(default_factory=list)
 
     @dataclass
     class UpdateRuleGroup:
@@ -487,8 +497,8 @@ class CompositeUpdateRule(UpdateRule):
     def __post_init__(self):
         self.groups = []
         self.selector: OptimizerSelector = RegexOptimizerSelector(
-            matching_factory=lambda: None, # TODO: bias layers are disabled for now
-            non_matching_factory=lambda: Muon(lr=self.lr, ns_steps=5, frozen=self.frozen_muon),
+            matching_factory=lambda: None,  # TODO: bias layers are disabled for now
+            non_matching_factory=lambda: FrozenMuon(lr=self.lr, ns_steps=5, freeze_schedule=self.freeze_schedule),
             pattern=".*bias",
         )
 
