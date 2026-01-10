@@ -650,9 +650,9 @@ class SingleBlockDiagonalPreconditioner(Preconditioner):
         self.n = n
     
     def __call__(self, v: Array) -> Array:
-        v = v.reshape(self.block.size(), self.n)
+        v = v.reshape(self.n, self.block.size()).T
         result = self.block(v)
-        return result.flatten()
+        return result.T.flatten()
 
     def sqrt(self) -> SingleBlockDiagonalPreconditioner:
         return SingleBlockDiagonalPreconditioner(self.block.sqrt(), self.n)
