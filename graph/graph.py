@@ -19,6 +19,7 @@ parser.add_argument(
     help="Smoothing window size for Hessian eigenvalues",
 )
 parser.add_argument("--raw", action="store_true", help="Plot raw Hessian eigenvalues")
+parser.add_argument("--eig-max", type=float, default=-1, help="Maximum y-axis for eigenvalues")
 
 args = parser.parse_args()
 
@@ -42,9 +43,9 @@ for exp_dir in args.exp:
 
     with h5py.File(data, "r", libver="latest", swmr=True) as df:
         discrete = df["discrete"]
-        loss_train = discrete["train_loss"][:]
-        # loss_test = discrete["test_loss"][:]
-        grad_sq = discrete["grad_norm_sq"][:]
+        loss_train = discrete["train_loss"]
+        # loss_test = discrete["test_loss"]
+        grad_sq = discrete["grad_norm_sq"]
         step = df["step"][:]
 
         i_min = 0
@@ -81,6 +82,9 @@ for exp_dir in args.exp:
 for i, (x, y, color, label) in enumerate(lines):
     # Ensure smoothed lines are plotted on top of the semitransparent ones
     ax3.plot(x, y, color=color, label=label)
+
+if args.eig_max > 0:
+    ax3.set_ylim(bottom=0, top=args.eig_max)
 
 ax1.legend()
 ax2.legend()
