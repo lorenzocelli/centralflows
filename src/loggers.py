@@ -109,7 +109,24 @@ class LossAndAccuracy(ProcessLogger):
             self.split + "_loss": loss,
             self.split + "_acc": acc,
         }
+ 
+
+@dataclass
+class OptimalErrorLogger(ProcessLogger):
+    """Logs the error with respect to optimal weights, if known."""
+    
+    model: FunctionalModel          # the model
+    data: Dataset                   # the dataset
+
+    def log(self, process: Process) -> Dict[str, Any]:
+        if self.data.w_optimal is None:
+            return {}
         
+        w = process.w
+        return {
+            "optimal_error": (w - self.data.w_optimal).norm()
+        }
+
 
 class OutputLogger(ProcessLogger):
     """Logs the network's output on a sample of train and test examples."""

@@ -47,6 +47,8 @@ class Dataset(NamedTuple):
     input_shape: Tuple[int, ...]
     """Shape of the input data."""
 
+    w_optimal: Optional[torch.Tensor] = None
+    """Optimal weights for the dataset, if known (e.g., for regression)."""
     
 
 @dataclass(kw_only=True)
@@ -113,6 +115,8 @@ class DatasetBuilder:
         
         # shuffle the data
         train, test = self._shuffle(train), self._shuffle(test)
+
+        w_optimal = self.get_optimal_weights()
         
         # convert data from numpy to pytorch
         train, test = self._to_torch(train, device=device), self._to_torch(test, device=device)
@@ -129,8 +133,13 @@ class DatasetBuilder:
             criterion_fn=criterion_fn,
             accuracy_fn=accuracy_fn,
             output_dim=self.get_output_dim(),
-            input_shape=trainset[0].inputs.shape[1:]
+            input_shape=trainset[0].inputs.shape[1:],
+            w_optimal=w_optimal
         )
+
+    def get_optimal_weights(self) -> Optional[torch.Tensor]:
+        """Return optimal weights for this dataset, if known."""
+        return None
 
     def _get_raw_data(self):
         """If cache exists, return it; otherwise try to download.
@@ -549,7 +558,13 @@ class Regression(DatasetBuilder):
     n_features: int = 500
 
     # whether to unevenly scale features (makes the problem harder)
-    uneven_scale: bool = True
+    uneven_scale: bool = False
+
+    # standard deviation of noise added to outputs
+    deviation: float = 0.0
+
+    # optimal weights (only if deviation=0.0)
+    w_optimal: Optional[torch.Tensor] = None
 
     def get_output_dim(self) -> int:
         return 1
@@ -558,7 +573,6 @@ class Regression(DatasetBuilder):
         return mse_loss, None
 
     def make(self, raw_data=None):
-        print(self.n)
         rng = np.random.default_rng(seed=42)
         X = torch.from_numpy(
             rng.standard_normal((self.n + self.n_test, self.n_features)).astype(
@@ -574,7 +588,11 @@ class Regression(DatasetBuilder):
             rng.standard_normal((self.n_features, 1)).astype(np.float32)
         )
 
-        y = torch.mm(X, w) + 0.1 * torch.from_numpy(
+        if self.deviation == 0.0:
+            # In case of noise w might not be optimal anymore
+            self.w_optimal = w.flatten()
+
+        y = torch.mm(X, w) + self.deviation * torch.from_numpy(
             rng.standard_normal((self.n + self.n_test, 1)).astype(np.float32)
         )
         X = X.numpy()
@@ -585,3 +603,6 @@ class Regression(DatasetBuilder):
         train_y, test_y = y[: self.n], y[self.n :]
 
         return Examples(train_x, train_y), Examples(test_x, test_y)
+
+    def get_optimal_weights(self):
+        return self.w_optimal

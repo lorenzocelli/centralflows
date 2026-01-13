@@ -114,6 +114,7 @@ def main(
         k: [
             loggers.LossAndAccuracy(model_fn, dataset, split="train"),   # log train loss/acc
             loggers.LossAndAccuracy(model_fn, dataset, split="test"),    # log test loss/acc
+            loggers.OptimalErrorLogger(model_fn, dataset),               # log distance to optimal weights if known
             loggers.OutputLogger(model_fn, dataset),                     # log network output
             loggers.EigLogger(),                                         # log top eigenvalues of effective Hessian
             loggers.RawEigLogger(),                                      # log top eigenvalues of "raw" Hessian
