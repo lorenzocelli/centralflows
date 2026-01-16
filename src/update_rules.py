@@ -382,6 +382,50 @@ def preconditioner_ns(G: Array, steps: int) -> Tuple[Array, Array]:
 
     return X, A
 
+def preconditioner_theoric(G: Array) -> Tuple[Array, Array]:
+    """
+    Computes the theoretical Muon update and preconditioner using exact SVD.
+    
+    This is the theoretical version without Newton-Schulz approximation.
+    The Muon preconditioner orthonormalizes the gradient matrix G:
+        P^{-1}(G) = U (where U is from the SVD G = U Σ V^T)
+    
+    Args:
+        G (Tensor): The input matrix G_0 (gradient block), shape (m, n).
+    
+    Returns:
+        X (Tensor): The orthonormalized update U.
+        A (Tensor): The explicit left-preconditioner matrix P_{Muon}^{-1}.
+    """
+    assert G.ndim == 2
+    m, n = G.shape
+    
+    # Compute SVD: G = U Σ V^T
+    U, S, Vt = torch.linalg.svd(G, full_matrices=False)
+    
+    # Apply Muon scaling based on aspect ratio
+    if m > n:
+        scale = (m / n) ** 0.5
+        # For tall matrices: orthonormalize along columns
+        X = U * scale
+        # Preconditioner: A @ G = X
+        # G = U Σ V^T => A = X V^T Σ^{-1} = scale * U V^T Σ^{-1}
+        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
+        A = scale * (U @ torch.diag(S_inv) @ Vt)
+    elif m < n:
+        # For wide matrices: transpose, apply scaling, transpose back
+        scale = (n / m) ** 0.5
+        # X corresponds to orthonormalizing rows
+        X = (Vt.T * scale)  # This gives us scaled V
+        # Preconditioner for wide case
+        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
+        A = scale * (U @ torch.diag(S_inv) @ Vt)
+    else:  # m == n
+        X = U
+        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
+        A = U @ torch.diag(S_inv) @ Vt
+    
+    return X, A
 
 @dataclass
 class Muon(UpdateRule):
@@ -389,6 +433,7 @@ class Muon(UpdateRule):
 
     lr: float = 0.02
     ns_steps: int = 5
+    theoric: bool = False # Use theorical SVD-based preconditioner, instead of Newton-Schulz
 
     def initialize_state(self, w: Array, unflatten_w: callable) -> Array:
         self.unflatten_w = unflatten_w
@@ -405,7 +450,12 @@ class Muon(UpdateRule):
     def P(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
         gradient = state["gradient"]
-        _, p = preconditioner_ns(gradient, steps=self.ns_steps)
+
+        if self.theoric:
+            _, p = preconditioner_theoric(gradient)
+        else:
+            _, p = preconditioner_ns(gradient, steps=self.ns_steps)
+        
         p.mul_(self.lr)
         n = max(gradient.size(-2), gradient.size(-1))
         return SingleBlockDiagonalPreconditioner(GenericPreconditioner(p), n)
@@ -425,7 +475,7 @@ class Muon(UpdateRule):
 
     def summarize_state(self, flat_state: Array) -> Array:
         state = self.unflatten(flat_state)
-        return {"t": state["t"], "lr": self.lr}
+        return {"t": state["t"], "lr": self.lr, "theoric": self.theoric}
 
 
 @dataclass
@@ -469,7 +519,7 @@ class CompositeUpdateRule(UpdateRule):
         self.groups = []
         self.selector: OptimizerSelector = RegexOptimizerSelector(
             matching_factory=lambda: None, # TODO: bias layers are disabled for now
-            non_matching_factory=lambda: Muon(lr=self.lr, ns_steps=5),
+            non_matching_factory=lambda: Muon(lr=self.lr, ns_steps=5, theoric=self.theoric),
             pattern=".*bias",
         )
 
