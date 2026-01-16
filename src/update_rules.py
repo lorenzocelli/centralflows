@@ -382,49 +382,28 @@ def preconditioner_ns(G: Array, steps: int) -> Tuple[Array, Array]:
 
     return X, A
 
-def preconditioner_theoric(G: Array) -> Tuple[Array, Array]:
-    """
-    Computes the theoretical Muon update and preconditioner using exact SVD.
-    
-    This is the theoretical version without Newton-Schulz approximation.
-    The Muon preconditioner orthonormalizes the gradient matrix G:
-        P^{-1}(G) = U (where U is from the SVD G = U Σ V^T)
-    
-    Args:
-        G (Tensor): The input matrix G_0 (gradient block), shape (m, n).
-    
-    Returns:
-        X (Tensor): The orthonormalized update U.
-        A (Tensor): The explicit left-preconditioner matrix P_{Muon}^{-1}.
-    """
+def preconditioner_theoric(G: Array, eps: float = 1e-10) -> Tuple[Array, Array]:
     assert G.ndim == 2
     m, n = G.shape
-    
-    # Compute SVD: G = U Σ V^T
-    U, S, Vt = torch.linalg.svd(G, full_matrices=False)
-    
-    # Apply Muon scaling based on aspect ratio
-    if m > n:
-        scale = (m / n) ** 0.5
-        # For tall matrices: orthonormalize along columns
-        X = U * scale
-        # Preconditioner: A @ G = X
-        # G = U Σ V^T => A = X V^T Σ^{-1} = scale * U V^T Σ^{-1}
-        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
-        A = scale * (U @ torch.diag(S_inv) @ Vt)
-    elif m < n:
-        # For wide matrices: transpose, apply scaling, transpose back
-        scale = (n / m) ** 0.5
-        # X corresponds to orthonormalizing rows
-        X = (Vt.T * scale)  # This gives us scaled V
-        # Preconditioner for wide case
-        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
-        A = scale * (U @ torch.diag(S_inv) @ Vt)
-    else:  # m == n
-        X = U
-        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
-        A = U @ torch.diag(S_inv) @ Vt
-    
+
+    U, S, Vt = torch.linalg.svd(G, full_matrices=False)  # U: (m,r), Vt: (r,n) with r=min(m,n)
+    # Polar factor (Muon orthogonalization)
+    X = U @ Vt  # shape (m,n)
+
+    # Same scaling convention as your NS branch
+    scale = (max(m, n) / min(m, n)) ** 0.5
+    # (if you want exactly your current behavior: scale only when m>n)
+    # if m > n: scale = (m/n)**0.5 else: scale = 1.0
+
+    X = X * scale
+
+    # Build G^+ robustly: V @ diag(1/S) @ U^T
+    Sinv = torch.where(S > eps, 1.0 / S, torch.zeros_like(S))
+    G_pinv = Vt.mT @ torch.diag(Sinv) @ U.mT   # shape (n,m)
+
+    # Left operator A such that A @ G == X (exact when using pinv; up to numerics)
+    A = X @ G_pinv  # (m,n)@(n,m) -> (m,m)
+
     return X, A
 
 @dataclass
