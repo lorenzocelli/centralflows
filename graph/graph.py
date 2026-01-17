@@ -23,6 +23,8 @@ parser.add_argument("--eig-max", type=float, default=-1, help="Maximum y-axis fo
 
 args = parser.parse_args()
 
+COLUMN_WIDTH = 3.287
+
 plt.rcParams["font.family"] = "sans-serif"
 plt.rcParams["font.sans-serif"] = ["CMU Sans Serif"]
 plt.rcParams["font.weight"] = "medium"
@@ -31,9 +33,9 @@ plt.rcParams["axes.unicode_minus"] = False
 plt.style.use("ggplot")
 
 if args.raw:
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(15, 5))
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(COLUMN_WIDTH, 4 * 2.5))
 else:
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(10, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(COLUMN_WIDTH, 3 * 2.5))
 
 lines = []
 
