@@ -485,6 +485,7 @@ class CompositeUpdateRule(UpdateRule):
     """An update rule that applies different optimizers to different parameter groups."""
 
     lr: float = 0.01
+    theoric: bool = False
 
     @dataclass
     class UpdateRuleGroup:
