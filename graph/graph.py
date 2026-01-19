@@ -13,6 +13,9 @@ parser.add_argument(
     "--max-iter", type=int, default=-1, help="Maximum number of iterations to plot"
 )
 parser.add_argument(
+    "--min-iter", type=int, default=-1, help="First iteration to plot"
+)
+parser.add_argument(
     "--smoothing",
     type=int,
     default=1,
@@ -23,17 +26,16 @@ parser.add_argument("--eig-max", type=float, default=-1, help="Maximum y-axis fo
 
 args = parser.parse_args()
 
+plt.style.use("ggplot")
 plt.rcParams["font.family"] = "sans-serif"
 plt.rcParams["font.sans-serif"] = ["CMU Sans Serif"]
 plt.rcParams["font.weight"] = "medium"
 plt.rcParams["axes.unicode_minus"] = False
 
-plt.style.use("ggplot")
-
 if args.raw:
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(15, 5))
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(4 * 2.5, 3.287))
 else:
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(10, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(3 * 2, 3.287))
 
 lines = []
 
@@ -43,12 +45,12 @@ for exp_dir in args.exp:
 
     with h5py.File(data, "r", libver="latest", swmr=True) as df:
         discrete = df["discrete"]
-        loss_train = discrete["train_loss"]
+        loss_train = discrete["optimal_error"]
         # loss_test = discrete["test_loss"]
         grad_sq = discrete["grad_norm_sq"]
         step = df["step"][:]
 
-        i_min = 0
+        i_min = args.min_iter if args.min_iter > 0 else 0
         i_max = args.max_iter if args.max_iter > 0 else len(step)
 
         ax1.plot(step[i_min:i_max], loss_train[i_min:i_max], label=f"Train {exp}")
@@ -86,18 +88,26 @@ for i, (x, y, color, label) in enumerate(lines):
 if args.eig_max > 0:
     ax3.set_ylim(bottom=0, top=args.eig_max)
 
-ax1.legend()
-ax2.legend()
-ax3.legend()
+# ax1.legend()
+# ax2.legend()
+# ax3.legend()
+ax1.axhline(y=0.05, color="k", linestyle="--", linewidth=0.8)
+ax1.set_ylim(bottom=0, top=0.09)
 
-ax1.set_title("Training Loss", fontsize=11, loc="left")
+ax1.set_title("Weights Error", fontsize=11, loc="left")
 ax2.set_title("Gradient Norm Squared", fontsize=11, loc="left")
-ax3.set_title("Effective Hessian Eigenvalues", fontsize=11, loc="left")
+ax3.set_title("Preconditioned Sharpness", fontsize=11, loc="left")
+
+# EoS line
+# ax3.axhline(2, color="black", linewidth=0.8, linestyle="--")
 
 if args.raw:
-    ax4.legend()
-    ax4.set_title("Raw Hessian Eigenvalues", fontsize=11, loc="left")
+    # ax4.legend()
+    ax4.set_title("Raw Hessian Sharpness", fontsize=11, loc="left")
+    ax4.set_ylim(bottom=2, top=4)
+
+fig.suptitle("Distance to Minimizer lr=1e-1", fontsize=11, fontweight="bold", y=0.94, x=0.049, ha="left")
 
 fig.tight_layout()
-
+plt.savefig(f"{'_'.join(args.exp)}.png", dpi=300, bbox_inches="tight", pad_inches=0)
 plt.show()
