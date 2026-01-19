@@ -90,10 +90,10 @@ if args.eig_max > 0:
 
 ax3.axhline(2, color="black", linewidth=0.8, linestyle="--")
 
-ax3.axvline(600, color="#188487", linewidth=0.8, linestyle="--")
-ax3.axvline(1000, color="#188487", linewidth=0.8, linestyle="--")
-ax3.annotate('unfreeze', xy=(600, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
-ax3.annotate('freeze', xy=(1000, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
+# ax3.axvline(600, color="#188487", linewidth=0.8, linestyle="--")
+# ax3.axvline(1000, color="#188487", linewidth=0.8, linestyle="--")
+# ax3.annotate('unfreeze', xy=(600, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
+# ax3.annotate('freeze', xy=(1000, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
 
 # ax1.legend()
 # ax2.legend()
@@ -101,7 +101,7 @@ ax3.annotate('freeze', xy=(1000, 5), color='#188487', horizontalalignment='right
 
 ax1.set_title("Training Loss", fontsize=11, loc="left")
 ax2.set_title("Gradient Norm Squared", fontsize=11, loc="left")
-ax3.set_title("Effective Hessian Eigenvalues", fontsize=11, loc="left")
+ax3.set_title("Preconditioned Sharpness", fontsize=11, loc="left")
 
 if args.raw:
     # ax4.legend()
