@@ -92,7 +92,7 @@ ax3.axhline(2, color="black", linewidth=0.8, linestyle="--")
 
 ax3.axvline(600, color="#188487", linewidth=0.8, linestyle="--")
 ax3.axvline(1000, color="#188487", linewidth=0.8, linestyle="--")
-ax3.annotate('unfreeze', xy=(500, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
+ax3.annotate('unfreeze', xy=(600, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
 ax3.annotate('freeze', xy=(1000, 5), color='#188487', horizontalalignment='right', verticalalignment='center', rotation=90)
 
 # ax1.legend()
